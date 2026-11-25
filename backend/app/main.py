@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 from contextlib import asynccontextmanager, suppress
 
 import httpx
@@ -9,6 +8,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from .amap_settings import read_settings, router as amap_settings_router, routing_key
 from .core.field import Grid
 from .providers.amap import AmapProvider
 from .schemas import Parameters
@@ -21,7 +21,9 @@ JOBS = f"{PREFIX}/isochrones/jobs"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with httpx.AsyncClient(follow_redirects=False) as client:
-        key = os.getenv("AMAP_WEB_SERVICE_KEY", "").strip()
+        app.state.amap_client = client
+        app.state.amap_settings = read_settings()
+        key = routing_key(app.state.amap_settings)
         manager = Jobs(AmapProvider(key, client) if key else None)
         app.state.jobs = manager
         try:
@@ -36,6 +38,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="TISO", lifespan=lifespan)
+app.include_router(amap_settings_router)
 
 
 def fail(status_code: int, code: str, message: str, **details):
@@ -66,9 +69,7 @@ async def health():
 
 @app.get(f"{PREFIX}/capabilities")
 async def capabilities(request: Request):
-    providers = ["mock"]
-    if request.app.state.jobs.amap:
-        providers.append("amap")
+    providers = ["amap"] if request.app.state.jobs.amap else []
     return {
         "providers": providers, "modes": ["driving"], "traffic_modes": ["current"],
         "coordinate_system": "GCJ-02", "max_points": 2000, "max_requests": 150,
@@ -85,8 +86,8 @@ async def estimate_job(params: Parameters):
 async def create_job(params: Parameters, request: Request):
     manager: Jobs = request.app.state.jobs
     manager.prune()
-    if params.provider == "amap" and manager.amap is None:
-        fail(422, "provider_unavailable", "高德 Web 服务未配置")
+    if manager.amap is None:
+        fail(422, "provider_unavailable", "请在高德设置中配置 Web 服务 Key")
     budget = estimate(Grid(params))
     if not budget["fits_budget"]:
         fail(422, "budget_exceeded", "超出计算预算", **budget)

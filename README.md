@@ -1,6 +1,6 @@
 # TISO
 
-TISO 是一个面向中国大陆城市的反向交通可达性分析工具。当前 P0 原型以目的地为中心，使用离线模拟数据展示从周边采样点出发的驾车耗时。
+TISO 是一个面向中国大陆城市的反向交通可达性分析工具。它使用高德地图和驾车算路服务，展示从周边采样点到目的地的耗时。
 
 ## Docker Compose 启动
 
@@ -8,7 +8,7 @@ TISO 是一个面向中国大陆城市的反向交通可达性分析工具。当
 docker compose up --build --wait
 ```
 
-在本机浏览器打开 `http://127.0.0.1:8080`，点击「生成等时圈」体验离线 Mock。Compose 默认只监听回环地址；可在根目录的 `.env` 中设置 `TISO_PORT`。Nginx 提供页面并同源代理 REST 与 SSE，后端端口仅在 Compose 网络中使用。停止服务执行 `docker compose down`。任务结果存放在进程内存中，默认最多保留 8 项，访问时清理超过 30 分钟的终态任务，重启后结果清空。
+在本机浏览器打开 `http://127.0.0.1:8080`，按页面提示配置高德底图和 Web 服务后即可生成等时圈。Compose 默认只监听回环地址，可在根目录的 `.env` 中设置 `TISO_PORT`。Nginx 提供页面并同源代理 REST 与 SSE，后端端口仅在 Compose 网络中使用。停止服务执行 `docker compose down`。任务结果存放在进程内存中，默认最多保留 8 项，访问时清理超过 30 分钟的终态任务，重启后结果清空。
 
 在使用自有代理 CA 的构建环境中，通过 BuildKit secret 提供可信 CA 文件。
 
@@ -35,17 +35,6 @@ npm ci
 npm run dev
 ```
 
-## 运行离线 CLI
-
-需要 Python 3.11 或更新版本。CLI 只依赖 Python 标准库。
-
-```sh
-cd backend
-python -m app.cli --lon 121.4737 --lat 31.2304
-```
-
-JSON 使用 GCJ-02，经度在前，包含目标点、耗时与距离、采集时间和模拟标识。示例中心耗时为零，北侧样本故意模拟不可达，耗时为 `null`。东西两侧的耗时不同，用于展示方向性。
-
 ## 运行测试
 
 安装 [uv](https://docs.astral.sh/uv/)，然后运行以下命令。如果云环境中的默认缓存目录不可写，可设置 `UV_CACHE_DIR=/tmp/tiso-uv-cache`。
@@ -68,9 +57,11 @@ python -m scripts.verify_amap --live --max-requests 2
 
 ## 启用高德
 
-有明确的调用授权后，可在根目录的 `.env` 中设置 `AMAP_WEB_SERVICE_KEY`，再运行 `docker compose up --wait`。网页继续默认使用 Mock，通过数据源选项选择高德后才会使用真实算路。预算按实际发出的请求计算，含重试。Web 服务 Key 只交给后端容器。
+在本机页面点右上角「高德设置」。底图和地点搜索需要高德开放平台的 **Web 端（JS API）Key** 和对应的 **JS API 安全密钥**。配置后会自动加载高德底图，搜索框位于左上浮窗。若 Key 设置了域名白名单，请使它与打开 TISO 的主机名一致，例如 `127.0.0.1` 或 `localhost`。设置面板和内置代理需要通过回环地址访问。[高德安全密钥说明](https://lbs.amap.com/api/javascript-api-v2/guide/abc/jscode)
 
-底图与地点搜索需要单独的 JS API Key 和已配置的高德 JS 安全代理。将公开的 `VITE_AMAP_JS_KEY` 和带 `/_AMapService` 路径的 `VITE_AMAP_SERVICE_HOST` 写入 `.env`，执行 `docker compose up --build --wait`。JS 安全密钥应保留在该代理。页面默认使用离线坐标视图，可以主动切换高德底图。底图和搜索的真实运行仍需按账号权限验证。
+驾车耗时使用独立的 **Web 服务 Key**。点击左上角「TISO」展开等时圈卡片，设置分析参数后生成等时圈。预算按实际发出的请求计算，含重试。左下方的色带图例显示耗时区间和算路时间。JS 安全密钥和 Web 服务 Key 保存在后端 Docker 命名卷中。已保存的密钥在设置中显示为圆点，可点击眼睛在本机查看原值。清除本地配置后，仍可由环境变量提供默认设置。
+
+已有环境配置可继续使用：后端读取 `AMAP_WEB_SERVICE_KEY`，网页构建读取 `VITE_AMAP_JS_KEY` 和 `VITE_AMAP_SERVICE_HOST`。本地开发若未设置 `TISO_SETTINGS_FILE`，页面内保存的配置只在当前后端进程中有效。
 
 ## 前端与端到端检查
 

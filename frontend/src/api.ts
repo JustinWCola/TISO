@@ -2,7 +2,6 @@ export type Coordinates = [number, number]
 export type Destination = { lng: number; lat: number }
 export type Parameters = {
   destination: Destination
-  provider: 'mock' | 'amap'
   radius_m: number
   spacing_m: number
   max_duration_min: number
@@ -21,7 +20,7 @@ export type FeatureCollection<T> = {
   features: { properties: Record<string, number>; geometry: { coordinates: T } }[]
 }
 export type Result = {
-  job_id: string; simulated: boolean; destination: Destination; radius_m: number; spacing_m: number
+  job_id: string; destination: Destination; radius_m: number; spacing_m: number
   contours: FeatureCollection<Coordinates[][]>; bands: FeatureCollection<Coordinates[][][]>
   samples: { coordinates: Coordinates; duration_s: number | null; status: string }[]
   coverage: number; warnings: string[]; observed_from: string | null; observed_to: string | null

@@ -8,7 +8,6 @@ from uuid import uuid4
 from .core.field import Grid, build_result
 from .providers.amap import AmapProvider
 from .providers.base import DRIVING_CAPABILITIES, TravelResult
-from .providers.mock import MockProvider
 from .schemas import Parameters
 
 TERMINAL = {"completed", "partial", "failed", "cancelled"}
@@ -24,7 +23,7 @@ def estimate(grid: Grid) -> dict:
     batches = math.ceil((points - 1) / DRIVING_CAPABILITIES.max_origins)
     return {
         "total_points": points, "route_points": points - 1, "batches": batches,
-        "estimated_requests": batches if grid.params.provider == "amap" else 0,
+        "estimated_requests": batches,
         "fits_budget": points <= grid.params.max_points and batches <= grid.params.max_requests,
     }
 
@@ -102,14 +101,7 @@ class Jobs:
         nodes = list(grid.nodes())
         origins = [point for _, _, point in nodes if point.id != "0:0"]
         destination = next(point for _, _, point in nodes if point.id == "0:0")
-        if job.params.provider == "mock":
-            # An offset strip of unknown samples makes mask behavior visible.
-            missing_ids = frozenset(
-                point.id for row, col, point in nodes if col == 2 and row >= 1
-            )
-            provider = MockProvider(missing_ids=missing_ids)
-        else:
-            provider = self.amap
+        provider = self.amap
         results = {"0:0": TravelResult("0:0", 0, 0, "ok", None, started_at)}
         job.completed_points = 1
         job.publish("running", "routing")
@@ -129,12 +121,9 @@ class Jobs:
                     raise ValueError("已达请求预算")
                 batch = origins[offset:offset + batch_size]
                 job.provider_batches += 1
-                if isinstance(provider, AmapProvider):
-                    batch_results = await provider.travel_time_matrix(
-                        batch, destination, "driving", before_request=before_request,
-                    )
-                else:
-                    batch_results = await provider.travel_time_matrix(batch, destination, "driving")
+                batch_results = await provider.travel_time_matrix(
+                    batch, destination, "driving", before_request=before_request,
+                )
                 for item in batch_results:
                     results[item.point_id] = item
                     observed_at = item.observed_at.isoformat()
@@ -142,7 +131,6 @@ class Jobs:
                     job.observed_to = max(job.observed_to or observed_at, observed_at)
                 job.completed_points = len(results)
                 job.publish("running", "routing")
-                await asyncio.sleep(0.012 if job.params.provider == "mock" else 0)
 
             if not any(item.status == "ok" for key, item in results.items() if key != "0:0"):
                 raise ValueError("未获得有效算路样本")
@@ -160,7 +148,7 @@ class Jobs:
                 warnings.append("已修复部分等时面几何。")
             result.update({
                 "job_id": job.id, "provider": job.params.provider,
-                "simulated": job.params.provider == "mock", "coordinate_system": "GCJ-02",
+                "coordinate_system": "GCJ-02",
                 "geometry_format": "GCJ-02 map geometry (non-RFC 7946)",
                 "direction": "origins_to_destination", "mode": "driving",
                 "traffic_mode": job.params.traffic_mode, "destination": job.params.destination.model_dump(),

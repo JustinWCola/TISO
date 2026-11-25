@@ -1,15 +1,33 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { amapConfigured, searchAmap } from './amap'
+import { amapNeedsReload, legacyAmapConfig, searchAmap } from './amap'
+import type { AmapConfig } from './amap'
+import AmapSettings from './AmapSettings'
+import type { SavedAmapSettings } from './AmapSettings'
+import Icon from './Icon'
 import MapView from './MapView'
 import { destinationFromInputs, jobs, request, terminal } from './api'
 import type { Destination, Estimate, Job, Parameters, Result } from './api'
 import './style.css'
 
 const shanghai = { lng: 121.4737, lat: 31.2304 }
+const samplingSpacings = [2000, 1000, 500] as const
+const contourIntervals = [5, 10, 15, 20, 30] as const
 const stages: Record<string, string> = {
   queued: '排队中', sampling: '采样中', routing: '算路中', geometry: '计算等时圈',
   completed: '计算完成', failed: '计算失败', cancelled: '已取消',
+}
+
+function AnalysisSlider({ label, value, min, max, step = 1, display, onChange }: {
+  label: string; value: number; min: number; max: number; step?: number; display: string
+  onChange: (value: number) => void
+}) {
+  return <label className="analysis-slider">
+    <span>{label}</span>
+    <input type="range" aria-label={label} aria-valuetext={display} min={min} max={max} step={step}
+      value={value} onChange={event => onChange(event.currentTarget.valueAsNumber)} />
+    <span className="slider-value" aria-hidden="true">{display}</span>
+  </label>
 }
 
 function App() {
@@ -20,39 +38,48 @@ function App() {
   const [searchStatus, setSearchStatus] = useState('')
   const [searching, setSearching] = useState(false)
   const [radius, setRadius] = useState(15)
-  const [spacing, setSpacing] = useState(1000)
+  const [precision, setPrecision] = useState(1)
   const [duration, setDuration] = useState(60)
-  const [interval, setInterval] = useState(15)
+  const [intervalIndex, setIntervalIndex] = useState(2)
   const [maxRequests, setMaxRequests] = useState(150)
-  const [provider, setProvider] = useState<Parameters['provider']>('mock')
-  const [hasAmap, setHasAmap] = useState(false)
+  const [savedAmap, setSavedAmap] = useState<SavedAmapSettings | null>(null)
+  const [panel, setPanel] = useState<'analysis' | 'amap' | null>(null)
+  const [layersOpen, setLayersOpen] = useState(false)
   const [job, setJob] = useState<Job | null>(null)
   const [starting, setStarting] = useState(false)
   const [error, setError] = useState('')
   const [connection, setConnection] = useState('')
   const [estimate, setEstimate] = useState<{ key: string; value: Estimate } | null>(null)
   const [estimateError, setEstimateError] = useState('')
-  const [result, setResult] = useState<{ key: string; value: Result } | null>(null)
+  const [result, setResult] = useState<Result | null>(null)
   const [bands, setBands] = useState(true)
   const [lines, setLines] = useState(true)
   const [samples, setSamples] = useState(false)
   const stream = useRef<EventSource | null>(null)
 
+  const jsKey = savedAmap?.js_key
+  const amapConfig = useMemo<AmapConfig | null>(() => jsKey ? {
+    key: jsKey, serviceHost: window.location.origin + '/_AMapService',
+  } : legacyAmapConfig, [jsKey])
+  const reloadMap = amapNeedsReload(amapConfig)
+  const canCalculate = Boolean(amapConfig && !reloadMap && savedAmap?.routing_configured)
+  const spacing = samplingSpacings[precision]
+  const interval = contourIntervals[intervalIndex]
+
   const destination = useMemo(() => destinationFromInputs(lng, lat), [lng, lat])
   const params = useMemo<Parameters | null>(() => destination && ({
-    destination, provider, radius_m: radius * 1000, spacing_m: spacing,
+    destination, radius_m: radius * 1000, spacing_m: spacing,
     max_duration_min: duration, contour_interval_min: interval,
     max_points: 2000, max_requests: maxRequests,
-  }), [destination, provider, radius, spacing, duration, interval, maxRequests])
+  }), [destination, radius, spacing, duration, interval, maxRequests])
   const key = JSON.stringify(params)
   const currentEstimate = estimate?.key === key ? estimate.value : null
   const busy = starting || (job !== null && !terminal.has(job.status))
-  const stale = result !== null && (result.key !== key || job?.job_id !== result.value.job_id)
 
   useEffect(() => {
     const abort = new AbortController()
-    request<{ providers: string[] }>('/capabilities', undefined, abort.signal)
-      .then(data => setHasAmap(data.providers.includes('amap')))
+    request<SavedAmapSettings>('/settings/amap', undefined, abort.signal)
+      .then(setSavedAmap)
       .catch(() => { if (!abort.signal.aborted) setConnection('无法读取服务配置') })
     return () => {
       abort.abort()
@@ -61,8 +88,24 @@ function App() {
   }, [])
 
   useEffect(() => {
+    if (!panel && !layersOpen) return
+    function dismiss(event: KeyboardEvent) {
+      if (event.key !== 'Escape') return
+      if (layersOpen) {
+        setLayersOpen(false)
+        document.getElementById('layers-toggle')?.focus()
+      } else {
+        setPanel(null)
+        document.getElementById(`${panel}-toggle`)?.focus()
+      }
+    }
+    window.addEventListener('keydown', dismiss)
+    return () => window.removeEventListener('keydown', dismiss)
+  }, [panel, layersOpen])
+
+  useEffect(() => {
     setEstimateError('')
-    if (!params) return
+    if (!params || !canCalculate) return
     const abort = new AbortController()
     const timer = window.setTimeout(() => {
       request<Estimate>('/isochrones/estimate', params, abort.signal)
@@ -73,7 +116,7 @@ function App() {
       window.clearTimeout(timer)
       abort.abort()
     }
-  }, [params, key])
+  }, [params, key, canCalculate])
 
   function choose(point: Destination) {
     if (destinationFromInputs(String(point.lng), String(point.lat))) {
@@ -83,12 +126,12 @@ function App() {
   }
 
   async function findPlace() {
-    if (searching || !query.trim()) return
+    if (!amapConfig || searching || !query.trim()) return
     setSearching(true)
     setPlaces([])
     setSearchStatus('')
     try {
-      const matches = await searchAmap(query.trim())
+      const matches = await searchAmap(amapConfig, query.trim())
       setPlaces(matches)
       if (!matches.length) setSearchStatus('未找到相关地点。')
     } catch (cause) {
@@ -98,8 +141,26 @@ function App() {
     }
   }
 
+  function saveAmap(settings: SavedAmapSettings) {
+    if (settings.js_key !== jsKey) {
+      setPlaces([])
+      setSearchStatus('')
+    }
+    setSavedAmap(settings)
+  }
+
+  function togglePanel(next: typeof panel) {
+    setPanel(current => current === next ? null : next)
+  }
+
+  function dismissMapPanels() {
+    setPanel(null)
+    setLayersOpen(false)
+  }
+
   async function generate() {
-    if (!params || busy || !currentEstimate?.fits_budget) return
+    if (!params || !canCalculate || busy || !currentEstimate?.fits_budget) return
+    dismissMapPanels()
     setStarting(true)
     setError('')
     setConnection('')
@@ -122,7 +183,7 @@ function App() {
         if (next.status === 'partial' || next.status === 'completed') {
           setStarting(true)
           try {
-            setResult({ key, value: await request<Result>(path + '/result') })
+            setResult(await request<Result>(path + '/result'))
           } catch (cause) {
             setError(cause instanceof Error ? cause.message : '无法读取结果')
           } finally {
@@ -151,112 +212,128 @@ function App() {
     }
   }
 
+  const analysisOpen = panel === 'analysis'
+  const settingsOpen = panel === 'amap'
+  const center = destination ?? result?.destination ?? shanghai
+  const setupMessage = !amapConfig
+    ? `请填写 Web 端 JS Key 和安全密钥${savedAmap?.routing_configured ? '。' : '，以及用于算路的 Web 服务 Key。'}`
+    : '请填写 Web 服务 Key，以计算驾车等时圈。'
+  const canCancel = job && !terminal.has(job.status)
+  const jobStatus = <div role="status" className="job-status">
+    {job ? <span>{job.status === 'partial' ? '计算完成 · 存在缺测' : stages[job.stage]} · {job.completed_points}/{job.total_points} 点{job.requests_sent > 0 ? ` · ${job.requests_sent} 次请求` : ''}</span>
+      : starting && <span>正在提交任务…</span>}
+    {connection && <span>{connection}</span>}
+    {error && <span className="error">{error}</span>}
+  </div>
+  const cancelButton = canCancel && <button type="button" className="secondary" onClick={() => void cancel()}>取消</button>
+  const coordinateFields = <div className="coordinates-entry">
+    <div className="pair">
+      <label>经度<input inputMode="decimal" value={lng} onChange={e => setLng(e.target.value)} /></label>
+      <label>纬度<input inputMode="decimal" value={lat} onChange={e => setLat(e.target.value)} /></label>
+    </div>
+    {!destination && <p className="hint error">请输入中国大陆范围内的经纬度。</p>}
+    <button type="button" className="text-button" onClick={() => choose(shanghai)}>使用上海示例</button>
+  </div>
+  const layerControl = <div className="layer-dock">
+    <button type="button" id="layers-toggle" className="floating-button"
+      aria-expanded={layersOpen} aria-controls="map-layers"
+      onClick={() => setLayersOpen(value => !value)}><Icon name="layers" />图层</button>
+    {layersOpen && <div className="layers floating-panel" id="map-layers" aria-label="结果图层">
+      <label><input type="checkbox" checked={bands} onChange={e => setBands(e.target.checked)} />等时面</label>
+      <label><input type="checkbox" checked={lines} onChange={e => setLines(e.target.checked)} />等时线</label>
+      <label><input type="checkbox" checked={samples} onChange={e => setSamples(e.target.checked)} />采样点</label>
+    </div>}
+  </div>
+
   return (
     <main className="app">
-      <header className="top">
-        <div className="brand"><span aria-hidden="true" className="brand-icon">◎</span>TISO</div>
-        <div className="tagline">交通可达性分析</div>
-        <span className="provider"><span className="signal" />{provider === 'mock' ? '离线模拟' : '高德实时驾车'}</span>
-      </header>
+      <MapView center={center} radius={radius * 1000} result={result}
+        bands={bands} lines={lines} samples={samples} onSelect={choose} onMapInteract={dismissMapPanels}
+        amapConfig={reloadMap ? null : amapConfig} layerControl={layerControl} onConfigure={() => setPanel('amap')}
+        jobControl={!analysisOpen && (busy || connection || error || job?.status === 'cancelled') &&
+          <div className="map-job">{jobStatus}{cancelButton}</div>}
+        setupPrompt={savedAmap && !canCalculate && !settingsOpen && <div className="map-setup">
+          {reloadMap ? <>
+            <strong>高德配置已更新</strong><p>刷新页面后会载入新的底图配置。</p>
+            <button type="button" className="primary" onClick={() => window.location.reload()}>刷新页面</button>
+          </> : <>
+            <strong>配置高德 API</strong><p>{setupMessage}</p>
+            <button type="button" className="primary" onClick={() => setPanel('amap')}>打开高德设置</button>
+          </>}
+        </div>} />
 
-      <div className="workspace">
-        <aside className="panel" aria-label="分析设置">
-          <form onSubmit={event => { event.preventDefault(); void generate() }}>
-            <h1>到达这里需要多久？</h1>
-            <p className="subheading">以目的地为中心，计算周边驾车可达范围。</p>
-
-            <fieldset>
-              <legend>目的地</legend>
-              <div className="pair">
-                <label>经度<input inputMode="decimal" value={lng} onChange={e => setLng(e.target.value)} /></label>
-                <label>纬度<input inputMode="decimal" value={lat} onChange={e => setLat(e.target.value)} /></label>
-              </div>
-              {!destination && <p className="hint error">请输入中国大陆范围内的经纬度。</p>}
-              <button type="button" className="text-button" onClick={() => choose(shanghai)}>使用上海示例</button>
-              {amapConfigured && <>
-                <div className="search">
-                  <input aria-label="地点关键词" placeholder="输入地点关键词" value={query}
-                    onChange={event => setQuery(event.target.value)} onKeyDown={event => {
-                      if (event.key === 'Enter') { event.preventDefault(); void findPlace() }
-                    }} />
-                  <button type="button" className="secondary" disabled={searching || !query.trim()}
-                    onClick={() => void findPlace()}>{searching ? '搜索中' : '搜索'}</button>
+      <div className={`dock analysis-dock${analysisOpen ? ' expanded' : ''}`}>
+        <button type="button" id="analysis-toggle" className="dock-toggle brand" aria-expanded={analysisOpen}
+          aria-controls="analysis-controls" onClick={() => togglePanel('analysis')}>
+          <span className="brand-icon"><Icon name="pin" /></span>
+          <span className="brand-name"><strong>TISO</strong><span>交通可达性</span></span>
+          {analysisOpen && <span className="dock-collapse">收起</span>}
+          <Icon name="chevron" />
+        </button>
+        <section className="dock-body" id="analysis-controls" aria-labelledby="analysis-title" inert={!analysisOpen}>
+          <div className="dock-content">
+            <div className="analysis-card">
+              <div className="analysis-heading">
+                <div className="mode-icon"><Icon name="car" /></div>
+                <div className="analysis-title">
+                  <h1 id="analysis-title">驾车等时圈</h1>
                 </div>
+              </div>
+
+              {amapConfig && !reloadMap ? <>
+                <form className="search" onSubmit={event => { event.preventDefault(); void findPlace() }}>
+                  <Icon name="search" />
+                  <input aria-label="地点关键词" placeholder="搜索目的地" value={query} onChange={event => setQuery(event.target.value)} />
+                  <button type="submit" className="text-button" disabled={searching || !query.trim()}>{searching ? '搜索中…' : '搜索'}</button>
+                  {!!places.length && <ul className="search-results">{places.map(({ name, point }, index) =>
+                    <li key={index}><button type="button" onClick={() => {
+                      choose(point); setQuery(name); setPlaces([])
+                    }}>{name}</button></li>)}</ul>}
+                </form>
                 {searchStatus && <p className="hint" role="status">{searchStatus}</p>}
-                <ul className="search-results">{places.map(({ name, point }, index) =>
-                  <li key={index}><button type="button" className="text-button" onClick={() => {
-                    choose(point); setPlaces([])
-                  }}>{name}</button></li>
-                )}</ul>
-              </>}
-            </fieldset>
+                <details className="coordinate-details"><summary>目的地坐标</summary>{coordinateFields}</details>
+              </> : coordinateFields}
+              {reloadMap && <p className="hint" role="status">刷新页面后应用新的高德底图配置。</p>}
 
-            <fieldset>
-              <legend>分析参数</legend>
-              {hasAmap && <label className="setting">数据源
-                <select value={provider} onChange={e => setProvider(e.target.value as Parameters['provider'])}>
-                  <option value="mock">离线模拟</option><option value="amap">高德 · 使用配额</option>
-                </select>
-              </label>}
-              <label className="setting">分析半径<select value={radius} onChange={e => setRadius(Number(e.target.value))}>
-                {[1, 3, 5, 10, 15, 20, 30].map(value => <option key={value} value={value}>{value} km</option>)}
-              </select></label>
-              <label className="setting">采样精度<select value={spacing} onChange={e => setSpacing(Number(e.target.value))}>
-                <option value={2000}>快速 · 2 km</option><option value={1000}>标准 · 1 km</option>
-                <option value={500}>精细 · 500 m</option>
-              </select></label>
-              <label className="setting">最长耗时<select value={duration} onChange={e => setDuration(Number(e.target.value))}>
-                {[15, 30, 45, 60, 90, 120].map(value => <option key={value} value={value}>{value} 分钟</option>)}
-              </select></label>
-              <label className="setting">等时线间隔<select value={interval} onChange={e => setInterval(Number(e.target.value))}>
-                {[5, 10, 15, 20, 30].map(value => <option key={value} value={value}>{value} 分钟</option>)}
-              </select></label>
-              <label className="setting">批次预算<input className="budget" type="number" min="1" max="150"
-                value={maxRequests || ''} onChange={e => setMaxRequests(Number(e.target.value))} /></label>
-            </fieldset>
-
-            <div className="estimate" aria-live="polite">
-              {currentEstimate ? <>
-                <span>{currentEstimate.total_points} 个采样点 · {currentEstimate.batches} 批</span>
-                <span>预计 {currentEstimate.estimated_requests} 次外部请求</span>
-                {!currentEstimate.fits_budget && <span className="error">超出预算，请缩小半径或降低精度。</span>}
-              </> : <span>{estimateError || (destination ? '等待预算估算…' : '请选择目的地')}</span>}
+              <div className="analysis-sliders">
+                <AnalysisSlider label="分析半径" value={radius} min={1} max={30} display={`${radius} km`} onChange={setRadius} />
+                <AnalysisSlider label="采样精度" value={precision} min={0} max={samplingSpacings.length - 1}
+                  display={spacing < 1000 ? `${spacing} m` : `${spacing / 1000} km`} onChange={setPrecision} />
+                <AnalysisSlider label="最长耗时" value={duration} min={15} max={120} step={5}
+                  display={`${duration} 分钟`} onChange={setDuration} />
+                <AnalysisSlider label="等时线间隔" value={intervalIndex} min={0} max={contourIntervals.length - 1}
+                  display={`${interval} 分钟`} onChange={setIntervalIndex} />
+                <AnalysisSlider label="批次预算" value={maxRequests} min={1} max={150}
+                  display={`${maxRequests} 批`} onChange={setMaxRequests} />
+              </div>
+              <div className="analysis-estimate" aria-live="polite">
+                {currentEstimate
+                  ? <span>{currentEstimate.total_points} 个采样点 · 预计 {currentEstimate.estimated_requests} 次请求</span>
+                  : <span>{estimateError || (!canCalculate ? '配置高德后可生成等时圈。' : destination ? '等待预算估算…' : '请选择目的地')}</span>}
+                {currentEstimate && !currentEstimate.fits_budget &&
+                  <span className="error">超出预算，请缩小半径或降低精度。</span>}
+              </div>
+              <div className="actions">
+                <button type="button" className="primary generate" disabled={!canCalculate || busy || !currentEstimate?.fits_budget}
+                  onClick={() => void generate()}>{busy ? '正在计算…' : '生成等时圈'}<Icon name="arrow" /></button>
+                {analysisOpen && cancelButton}
+              </div>
+              {analysisOpen && (job || connection || error) && jobStatus}
             </div>
-            <div className="actions">
-              <button className="primary" disabled={busy || !currentEstimate?.fits_budget}>
-                {busy ? '正在计算…' : '生成等时圈'}<span aria-hidden="true"> ↗</span>
-              </button>
-              {job && !terminal.has(job.status) &&
-                <button type="button" className="secondary" onClick={() => void cancel()}>取消</button>}
-            </div>
-          </form>
-          <div role="status" className="job-status">
-            {job && <span>{job.status === 'partial' ? '计算完成 · 存在缺测' : stages[job.stage]} · {job.completed_points}/{job.total_points} 点 · {job.requests_sent} 次外部请求</span>}
-            {connection && <span>{connection}</span>}
-            {error && <span className="error">{error}</span>}
           </div>
-        </aside>
+        </section>
+      </div>
 
-        <div className="visual">
-          <div className="toolbar">
-            <div className="layers" aria-label="结果图层">
-              <label><input type="checkbox" checked={bands} onChange={e => setBands(e.target.checked)} />等时面</label>
-              <label><input type="checkbox" checked={lines} onChange={e => setLines(e.target.checked)} />等时线</label>
-              <label><input type="checkbox" checked={samples} onChange={e => setSamples(e.target.checked)} />采样点</label>
-            </div>
-            <span>驾车 · 反向可达</span>
-          </div>
-          <MapView center={destination ?? result?.value.destination ?? shanghai} radius={radius * 1000}
-            result={result?.value ?? null} bands={bands} lines={lines} samples={samples} onSelect={choose} />
-          <div className="map-footer" aria-live="polite">
-            {result ? <>
-              <strong>{stale ? '旧结果 · ' : ''}{result.value.simulated ? '模拟数据' : '高德驾车数据'}</strong>
-              <span>{result.value.success_count}/{result.value.sample_count} 点有效 ·
-                未知区域 {((1 - result.value.coverage) * 100).toFixed(1)}%</span>
-              {result.value.observed_from && result.value.observed_to && <span>{new Date(result.value.observed_from).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai' })}
-                –{new Date(result.value.observed_to).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai' })}（北京时间）</span>}
-              <span>耗时为近似值。{result.value.warnings.join('')}</span>
-            </> : <span>设置目的地后生成结果。坐标视图可离线使用。</span>}
+      <div className={`dock settings-dock${settingsOpen ? ' expanded' : ''}`}>
+        <button type="button" id="amap-toggle" className="dock-toggle amap-toggle" disabled={!savedAmap}
+          aria-expanded={settingsOpen} aria-controls="amap-settings" onClick={() => togglePanel('amap')}>
+          <span className="brand-icon"><Icon name="key" /></span><span>高德设置</span>
+          {settingsOpen && <span className="dock-collapse">收起</span>}
+          <Icon name="chevron" />
+        </button>
+        <div className="dock-body" id="amap-settings" inert={!settingsOpen}>
+          <div className="dock-content">
+            {savedAmap && <AmapSettings key={String(settingsOpen)} settings={savedAmap} busy={busy} onSave={saveAmap} />}
           </div>
         </div>
       </div>

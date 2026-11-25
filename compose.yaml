@@ -4,6 +4,9 @@ services:
     build: ./backend
     environment:
       AMAP_WEB_SERVICE_KEY: ${AMAP_WEB_SERVICE_KEY:-}
+      TISO_SETTINGS_FILE: /var/lib/tiso/amap.json
+    volumes:
+      - settings:/var/lib/tiso
     healthcheck:
       test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/api/v1/health', timeout=2).close()"]
       interval: 5s
@@ -25,3 +28,6 @@ services:
     ports:
       - "127.0.0.1:${TISO_PORT:-8080}:80"
     restart: unless-stopped
+
+volumes:
+  settings:

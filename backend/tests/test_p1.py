@@ -1,6 +1,7 @@
 import asyncio
 import json
 import math
+import stat
 
 import httpx
 import numpy as np
@@ -57,16 +58,106 @@ def test_all_masked_geometry_is_empty():
 
 
 @pytest.fixture
-def client(monkeypatch):
-    monkeypatch.delenv("AMAP_WEB_SERVICE_KEY", raising=False)
+def amap_client(monkeypatch):
+    monkeypatch.setenv("AMAP_WEB_SERVICE_KEY", "test-routing-key")
+    monkeypatch.delenv("TISO_SETTINGS_FILE", raising=False)
+
+    async def upstream(url, *, params):
+        lng, lat = map(float, params["destination"].split(","))
+        rows = []
+        for index, origin in enumerate(params["origins"].split("|"), 1):
+            if index == 1:
+                continue
+            x, y = map(float, origin.split(","))
+            distance = math.hypot((x - lng) * 95_000, (y - lat) * 111_000)
+            rows.append({"origin_id": index, "dest_id": 1, "duration": distance * 1.5, "distance": distance})
+        return httpx.Response(200, json={"status": "1", "results": rows})
+
     with TestClient(app) as test_client:
+        monkeypatch.setattr(app.state.amap_client, "get", upstream)
         yield test_client
 
 
-def test_mock_job_from_estimate_through_sse_to_result(client):
-    params = {"destination": DESTINATION, "radius_m": 5000}
+def test_local_amap_settings_persist_and_proxy_keeps_credentials_private(monkeypatch, tmp_path):
+    saved = tmp_path / "amap.json"
+    origin = "http://127.0.0.1:8080"
+    url = "/api/v1/settings/amap"
+    keys = {"js_key": "public-js-fixture", "js_security_code": "private-js-fixture", "web_service_key": "private-web-fixture"}
+    monkeypatch.delenv("AMAP_WEB_SERVICE_KEY", raising=False)
+    monkeypatch.setenv("TISO_SETTINGS_FILE", str(saved))
+
+    with TestClient(app, base_url=origin) as client:
+        assert client.post(url, json=keys, headers={"Origin": "https://example.org"}).status_code == 403
+        assert client.post(url, json={"js_key": keys["js_key"]}, headers={"Origin": origin}).status_code == 422
+        assert not saved.exists()
+        response = client.post(url, json=keys, headers={"Origin": origin})
+        assert response.status_code == 200
+        public = {"js_key": keys["js_key"], "routing_configured": True, "web_service_saved": True}
+        assert response.json() == public
+        assert client.get("/api/v1/capabilities").json()["providers"] == ["amap"]
+        assert stat.S_IMODE(saved.stat().st_mode) == 0o600
+
+    with TestClient(app, base_url=origin) as client:
+        assert client.get(url).json() == public
+        reveal = url + "/reveal"
+        selection = {"field": "js_security_code"}
+        assert client.get(reveal).status_code == 405
+        assert client.post(reveal, json=selection).status_code == 403
+        assert client.post(reveal, json=selection, headers={"Origin": "https://example.org"}).status_code == 403
+        assert client.post(reveal, json=selection, headers={"Origin": origin, "Sec-Fetch-Site": "cross-site"}).status_code == 403
+        for field in ("js_security_code", "web_service_key"):
+            response = client.post(reveal, json={"field": field}, headers={"Origin": origin})
+            assert response.json() == {"value": keys[field]}
+            assert response.headers["cache-control"] == "no-store"
+        assert client.post(url, json={"js_key": keys["js_key"]}, headers={"Origin": origin}).json() == public
+        assert json.loads(saved.read_bytes()) == keys
+
+        async def upstream(request_url, *, params, headers, timeout):
+            assert request_url == "https://restapi.amap.com/v3/place/text"
+            assert dict(params)["jscode"] == keys["js_security_code"]
+            assert keys["web_service_key"] not in str(params)
+            callback = dict(params).get("callback")
+            if callback:
+                return httpx.Response(200, content=f'{callback}({{"status":"1","pois":[{{"name":"人民广场"}}]}})',
+                                      headers={"content-type": "application/json;charset=UTF-8"})
+            return httpx.Response(200, json={"status": "1", "echo": keys["js_security_code"]})
+
+        monkeypatch.setattr(app.state.amap_client, "get", upstream)
+        proxy = "/_AMapService/v3/place/text"
+        assert client.get(proxy, headers={"Sec-Fetch-Site": "cross-site"}).status_code == 403
+        headers = {"Sec-Fetch-Site": "same-origin"}
+        assert client.get(proxy, params={"key": "wrong"}, headers=headers).status_code == 403
+        response = client.get(proxy, params={"key": keys["js_key"], "jscode": "override"}, headers=headers)
+        assert response.status_code == 200
+        assert response.json() == {"status": "1", "echo": "[redacted]"}
+
+        jsonp_headers = {**headers, "Sec-Fetch-Dest": "script"}
+        response = client.get(proxy, params={"callback": "amapSearchCallback", "key": keys["js_key"]},
+                              headers=jsonp_headers)
+        assert response.headers["content-type"] == "application/javascript; charset=utf-8"
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert json.loads(response.text.removeprefix("amapSearchCallback(").removesuffix(");"))["pois"] == [
+            {"name": "人民广场"},
+        ]
+        response = client.get(proxy, params={"callback": "amapSearchCallback);alert(1)", "key": keys["js_key"]},
+                              headers=jsonp_headers)
+        assert response.headers["content-type"].startswith("application/json")
+
+        response = client.post(url, json={key: "" for key in keys}, headers={"Origin": origin})
+        assert response.json() == {"js_key": "", "routing_configured": False, "web_service_saved": False}
+        assert client.get("/api/v1/capabilities").json()["providers"] == []
+        response = client.post(BASE + "/jobs", json={"destination": DESTINATION})
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "provider_unavailable"
+        legacy_request = client.post(BASE + "/jobs", json={"destination": DESTINATION, "provider": "mock"})
+        assert legacy_request.json()["error"]["code"] == "invalid_parameters"
+
+
+def test_amap_job_from_estimate_through_sse_to_result(amap_client):
+    client = amap_client
+    params = {"destination": DESTINATION, "radius_m": 1000}
     estimate = client.post(BASE + "/estimate", json=params).json()
-    assert estimate["fits_budget"] and estimate["estimated_requests"] == 0
+    assert estimate["fits_budget"] and estimate["estimated_requests"] == 1
     response = client.post(BASE + "/jobs", json=params)
     assert response.status_code == 202
     job_path = BASE + "/jobs/" + response.json()["job_id"]
@@ -82,7 +173,8 @@ def test_mock_job_from_estimate_through_sse_to_result(client):
     result = client.get(job_path + "/result").json()
     assert result["sample_count"] == estimate["total_points"]
     assert result["direction"] == "origins_to_destination"
-    assert result["simulated"] and result["request_count"] == 0
+    assert result["provider"] == "amap" and result["request_count"] == 1
+    assert result["observed_from"] and result["observed_to"]
     assert result["contours"]["features"] and result["bands"]["features"]
     center = next(sample for sample in result["samples"] if sample["id"] == "0:0")
     assert center["duration_s"] == 0
@@ -91,7 +183,8 @@ def test_mock_job_from_estimate_through_sse_to_result(client):
                if sample["status"] != "ok")
 
 
-def test_budget_rejection_and_idempotent_cancellation(client):
+def test_budget_rejection_and_idempotent_cancellation(amap_client):
+    client = amap_client
     params = {"destination": DESTINATION, "max_points": 2}
     assert client.post(BASE + "/estimate", json=params).json()["fits_budget"] is False
     limited = client.post(BASE + "/jobs", json=params)

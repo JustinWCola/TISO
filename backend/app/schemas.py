@@ -17,7 +17,7 @@ class Parameters(BaseModel):
     destination: Destination
     mode: Literal["driving"] = "driving"
     traffic_mode: Literal["current"] = "current"
-    provider: Literal["mock", "amap"] = "mock"
+    provider: Literal["amap"] = "amap"
     sampling: Literal["uniform"] = "uniform"
     radius_m: int = Field(default=15000, ge=1000, le=30000)
     spacing_m: Literal[500, 1000, 2000] = 1000
