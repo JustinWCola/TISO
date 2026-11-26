@@ -3,13 +3,12 @@ import json
 from contextlib import asynccontextmanager, suppress
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .amap_settings import read_settings, router as amap_settings_router, routing_key
-from .core.field import Grid
 from .providers.amap import AmapProvider
 from .schemas import Parameters
 from .tasks import TERMINAL, Jobs, estimate
@@ -73,13 +72,14 @@ async def capabilities(request: Request):
     return {
         "providers": providers, "modes": ["driving"], "traffic_modes": ["current"],
         "coordinate_system": "GCJ-02", "max_points": 2000, "max_requests": 150,
+        "sampling": "adaptive", "grid": "hexagonal",
         "supports_departure_time": False, "supports_arrival_time": False,
     }
 
 
 @app.post(f"{PREFIX}/isochrones/estimate")
 async def estimate_job(params: Parameters):
-    return estimate(Grid(params))
+    return estimate(params)
 
 
 @app.post(JOBS, status_code=202)
@@ -88,7 +88,7 @@ async def create_job(params: Parameters, request: Request):
     manager.prune()
     if manager.amap is None:
         fail(422, "provider_unavailable", "请在高德设置中配置 Web 服务 Key")
-    budget = estimate(Grid(params))
+    budget = estimate(params)
     if not budget["fits_budget"]:
         fail(422, "budget_exceeded", "超出计算预算", **budget)
     if manager.active and not manager.active.done():
@@ -123,6 +123,22 @@ async def job_result(job_id: str, request: Request):
     if job.result is None:
         fail(409, "result_unavailable", "任务暂无结果", status=job.status)
     return job.result
+
+
+@app.get(f"{JOBS}/{{job_id}}/preview")
+async def job_preview(job_id: str, request: Request):
+    job = get_job(request, job_id)
+    if job.preview is None:
+        fail(409, "preview_unavailable", "任务暂无预览", status=job.status)
+    return job.preview
+
+
+@app.get(f"{JOBS}/{{job_id}}/samples")
+async def job_samples(job_id: str, request: Request, after: int = Query(0, ge=0)):
+    samples = get_job(request, job_id).samples
+    start = min(after, len(samples))
+    batch = samples[start:start + 256]
+    return {"samples": batch, "next": start + len(batch)}
 
 
 @app.get(f"{JOBS}/{{job_id}}/events")

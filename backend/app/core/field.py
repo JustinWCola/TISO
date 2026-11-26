@@ -12,6 +12,7 @@ from app.providers.base import Point, TravelResult
 from app.schemas import Parameters
 
 METRES_PER_DEGREE = math.pi * 6_371_008.8 / 180
+GeometryResult = tuple[dict, dict, float, bool, int]
 
 
 @dataclass(frozen=True)
@@ -60,7 +61,7 @@ def feature_collection(features):
     return {"type": "FeatureCollection", "features": features}
 
 
-def build_geometry(grid: Grid, durations: np.ndarray) -> tuple[dict, dict, float, bool, int]:
+def build_geometry(grid: Grid, durations: np.ndarray) -> GeometryResult:
     p = grid.params
     axis = np.arange(-grid.extent, grid.extent + 1) * p.spacing_m
     mask = ~np.isfinite(durations)
@@ -112,26 +113,26 @@ def build_geometry(grid: Grid, durations: np.ndarray) -> tuple[dict, dict, float
     return feature_collection(lines), feature_collection(bands), min(1.0, coverage / domain.area), truncated, repairs
 
 
-def build_result(grid: Grid, nodes: list, results: dict[str, TravelResult]) -> dict:
-    shape = (2 * grid.extent + 1,) * 2
-    durations = np.full(shape, np.nan)
+def sample_record(point: Point, result: TravelResult) -> dict:
+    return {
+        "id": point.id, "coordinates": [point.lon, point.lat],
+        "duration_s": result.duration_s, "status": result.status,
+        "observed_at": result.observed_at.isoformat(),
+    }
+
+
+def sample_payload(points: Iterable[Point], results: dict[str, TravelResult], geometry: GeometryResult) -> dict:
     samples = []
     counts = {"ok": 0, "unreachable": 0, "error": 0}
-    for row, col, point in nodes:
+    for point in points:
         result = results[point.id]
         counts[result.status] += 1
-        if result.duration_s is not None:
-            durations[row + grid.extent, col + grid.extent] = result.duration_s
-        samples.append({
-            "id": point.id, "coordinates": [point.lon, point.lat],
-            "duration_s": result.duration_s, "status": result.status,
-            "observed_at": result.observed_at.isoformat(),
-        })
+        samples.append(sample_record(point, result))
 
-    contours, bands, coverage, truncated, repairs = build_geometry(grid, durations)
+    contours, bands, coverage, truncated, repairs = geometry
     return {
         "samples": samples, "contours": contours, "bands": bands,
         "coverage": coverage, "boundary_truncated": truncated, "geometry_repairs": repairs,
-        "sample_count": len(nodes), "success_count": counts["ok"],
+        "sample_count": len(samples), "success_count": counts["ok"],
         "unreachable_count": counts["unreachable"], "error_count": counts["error"],
     }

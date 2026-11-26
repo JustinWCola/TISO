@@ -2,17 +2,20 @@ import asyncio
 import json
 import math
 import stat
+from datetime import UTC, datetime
 
 import httpx
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
-from shapely.geometry import shape
+from shapely.geometry import Point as GeometryPoint, shape
+from shapely.ops import unary_union
 
 from app.core.field import Grid, build_geometry
+from app.core.hex_sampling import meters, ring_radius
 from app.main import app
 from app.providers.amap import AmapProvider
-from app.providers.base import Point
+from app.providers.base import Point, TravelResult
 from app.schemas import Parameters
 
 BASE = "/api/v1/isochrones"
@@ -155,7 +158,7 @@ def test_local_amap_settings_persist_and_proxy_keeps_credentials_private(monkeyp
 
 def test_amap_job_from_estimate_through_sse_to_result(amap_client):
     client = amap_client
-    params = {"destination": DESTINATION, "radius_m": 1000}
+    params = {"destination": DESTINATION, "radius_m": 1000, "max_requests": 1}
     estimate = client.post(BASE + "/estimate", json=params).json()
     assert estimate["fits_budget"] and estimate["estimated_requests"] == 1
     response = client.post(BASE + "/jobs", json=params)
@@ -174,6 +177,7 @@ def test_amap_job_from_estimate_through_sse_to_result(amap_client):
     assert result["sample_count"] == estimate["total_points"]
     assert result["direction"] == "origins_to_destination"
     assert result["provider"] == "amap" and result["request_count"] == 1
+    assert result["sampling"] == "adaptive" and result["grid"] == "hexagonal"
     assert result["observed_from"] and result["observed_to"]
     assert result["contours"]["features"] and result["bands"]["features"]
     center = next(sample for sample in result["samples"] if sample["id"] == "0:0")
@@ -197,6 +201,123 @@ def test_budget_rejection_and_idempotent_cancellation(amap_client):
     assert client.post(path + "/cancel").json()["status"] == "cancelled"
     assert client.post(path + "/cancel").json()["status"] == "cancelled"
     assert client.get(path + "/result").status_code == 409
+
+
+@pytest.mark.parametrize("case, max_requests, truncated", [
+    ("corridor", 150, False), ("corridor", 2, True), ("missing", 150, True), ("pocket", 150, False),
+])
+def test_expanding_hex_job_and_sample_cursor(amap_client, monkeypatch, case, max_requests, truncated):
+    probes = []
+    batches = []
+    observed = datetime(2026, 11, 25, tzinfo=UTC)
+
+    async def route(origins, destination, mode, *, before_request):
+        assert destination.id == "0:0"
+        before_request()
+        batches.append(origins)
+        expanding = app.state.jobs.items[next(reversed(app.state.jobs.items))].stage == "expanding"
+        results = []
+        for point in origins:
+            r, q = map(int, point.id.split(":"))
+            if expanding:
+                probes.append((q, r))
+            x, y = meters((q, r))
+            duration = math.hypot(x * 0.055, y * 0.7)
+            if case == "pocket":
+                duration = min(math.hypot(x, y) * 0.63, 600 + math.hypot(x - 10_000, y) * 0.4)
+            if case == "missing" and y == 0 and x > 0:
+                duration = None
+            results.append(TravelResult(point.id, duration, None, "ok" if duration is not None else "error",
+                                        None, observed))
+        return results
+
+    monkeypatch.setattr(app.state.jobs.amap, "travel_time_matrix", route)
+    params = {"destination": DESTINATION, "max_duration_min": 15, "min_spacing_m": 500, "max_requests": max_requests}
+    created = amap_client.post(BASE + "/jobs", json=params)
+    assert created.status_code == 202
+    path = BASE + "/jobs/" + created.json()["job_id"]
+    amap_client.get(path + "/events")
+    result = amap_client.get(path + "/result").json()
+    assert result["boundary_truncated"] is truncated
+    assert result["request_count"] <= max_requests
+    assert [ring_radius(node) for node in probes[:18]] == [4] * 6 + [8] * 12
+    assert all(q % 8 == r % 8 == 0 for q, r in probes[18:])
+    grid = Grid(Parameters(**params))
+    if case == "corridor" and not truncated:
+        assert result["minimum_spacing_m"] == 500
+        east = max(p[0] for feature in result["contours"]["features"]
+                   for segment in feature["geometry"]["coordinates"] for p in segment)
+        assert east > grid.coordinates(15_000, 0)[0]
+        # The previous full-ring search needed 23 rings before two consecutive safe rings.
+        old_seed_requests = sum(math.ceil(6 * index / 20) for index in range(1, 24))
+        assert result["request_count"] < old_seed_requests
+        assert result["route_points"] < sum(6 * index for index in range(1, 24))
+        band = unary_union([shape(feature["geometry"]) for feature in result["bands"]["features"]])
+        lng, lat = grid.coordinates(0, 0)
+        east_unit, north_unit = grid.coordinates(1, 1)
+        expected_area = math.pi * (900 / 0.055) * (900 / 0.7) * (east_unit - lng) * (north_unit - lat)
+        assert band.area == pytest.approx(expected_area, rel=0.12)
+    elif case == "missing":
+        assert result["radius_m"] > 28_000
+        assert result["error_count"] > 0
+    elif case == "pocket":
+        # A far scout sees the pocket before a nearer, skipped location is backfilled.
+        assert probes.index((40, 0)) < probes.index((32, 0))
+        # The inner backfill shares a request with the next independently scheduled outer scouts.
+        def radii(batch):
+            return {ring_radius(tuple(map(int, point.id.split(":")))) for point in batch}
+
+        assert any({32, 48} <= radii(batch) for batch in batches)
+        band = unary_union([shape(feature["geometry"]) for feature in result["bands"]["features"]])
+        assert band.covers(GeometryPoint(*grid.coordinates(10_000, 0)))
+        assert not band.covers(GeometryPoint(*grid.coordinates(6_000, 0)))
+        center_x, center_y = grid.coordinates(10_000, 0)
+        east, north = grid.coordinates(10_001, 1)
+        pocket_radii = [
+            math.hypot((x - center_x) / (east - center_x), (y - center_y) / (north - center_y))
+            for feature in result["contours"]["features"]
+            for line in feature["geometry"]["coordinates"] for x, y in line
+            if x > grid.coordinates(6000, 0)[0]
+        ]
+        assert pocket_radii and max(abs(radius - 750) for radius in pocket_radii) < 60
+    taken = [point.id for batch in batches for point in batch]
+    assert len(taken) == len(set(taken))
+    assert all(all(int(axis) % 2 == 0 for axis in node.split(":")) for node in taken)
+    collected = []
+    for cursor in range(0, len(taken) + 1, 256):
+        page = amap_client.get(path + "/samples", params={"after": cursor}).json()
+        collected.extend(item["id"] for item in page["samples"])
+        assert page["next"] == len(collected)
+    assert collected == ["0:0", *taken]
+    assert amap_client.get(path + "/samples", params={"after": len(collected)}).json() == {
+        "samples": [], "next": len(collected),
+    }
+
+
+def test_refinement_preview_survives_retry_budget_and_keeps_coarse_result(amap_client, monkeypatch):
+    routing_calls = []
+    coarse_response = app.state.amap_client.get
+
+    async def upstream(url, *, params):
+        routing_calls.append(params["origins"])
+        if len(routing_calls) > 1:
+            return httpx.Response(429)
+        return await coarse_response(url, params=params)
+
+    monkeypatch.setattr(app.state.amap_client, "get", upstream)
+    params = {"destination": DESTINATION, "radius_m": 1000, "max_requests": 2}
+    created = amap_client.post(BASE + "/jobs", json=params)
+    assert created.status_code == 202
+    path = BASE + "/jobs/" + created.json()["job_id"]
+    events = amap_client.get(path + "/events").text
+    assert '"preview_ready": true' in events
+    assert '"status": "partial"' in events
+    result = amap_client.get(path + "/result").json()
+    assert not result["preview"] and result["request_count"] == len(routing_calls) == 2
+    assert result["sample_count"] == 19
+    assert result["bands"]["features"]
+    assert any("加密提前结束" in warning for warning in result["warnings"])
+    assert set(routing_calls[0].split("|")).isdisjoint(routing_calls[1].split("|"))
 
 
 def test_amap_request_is_reverse_and_restores_result_order():

@@ -7,14 +7,15 @@ import type { SavedAmapSettings } from './AmapSettings'
 import Icon from './Icon'
 import MapView from './MapView'
 import { destinationFromInputs, jobs, request, terminal } from './api'
-import type { Destination, Estimate, Job, Parameters, Result } from './api'
+import type { Destination, Estimate, Job, Parameters, Result, Sample } from './api'
 import './style.css'
 
 const shanghai = { lng: 121.4737, lat: 31.2304 }
-const samplingSpacings = [2000, 1000, 500] as const
+const minimumSpacings = [250, 500, 1000] as const
 const contourIntervals = [5, 10, 15, 20, 30] as const
 const stages: Record<string, string> = {
-  queued: '排队中', sampling: '采样中', routing: '算路中', geometry: '计算等时圈',
+  queued: '排队中', sampling: '采样中', routing: '算路中', expanding: '向外采样中', geometry: '计算等时圈',
+  preview: '计算初步等时圈', refining: '六边形网格加密中',
   completed: '计算完成', failed: '计算失败', cancelled: '已取消',
 }
 
@@ -37,11 +38,9 @@ function App() {
   const [places, setPlaces] = useState<Awaited<ReturnType<typeof searchAmap>>>([])
   const [searchStatus, setSearchStatus] = useState('')
   const [searching, setSearching] = useState(false)
-  const [radius, setRadius] = useState(15)
-  const [precision, setPrecision] = useState(1)
+  const [spacingIndex, setSpacingIndex] = useState(0)
   const [duration, setDuration] = useState(60)
   const [intervalIndex, setIntervalIndex] = useState(2)
-  const [maxRequests, setMaxRequests] = useState(150)
   const [savedAmap, setSavedAmap] = useState<SavedAmapSettings | null>(null)
   const [panel, setPanel] = useState<'analysis' | 'amap' | null>(null)
   const [layersOpen, setLayersOpen] = useState(false)
@@ -52,9 +51,11 @@ function App() {
   const [estimate, setEstimate] = useState<{ key: string; value: Estimate } | null>(null)
   const [estimateError, setEstimateError] = useState('')
   const [result, setResult] = useState<Result | null>(null)
+  const [preview, setPreview] = useState<Result | null>(null)
   const [bands, setBands] = useState(true)
   const [lines, setLines] = useState(true)
   const [samples, setSamples] = useState(false)
+  const [liveSamples, setLiveSamples] = useState<{ jobId: string; points: Sample[] } | null>(null)
   const stream = useRef<EventSource | null>(null)
 
   const jsKey = savedAmap?.js_key
@@ -63,18 +64,50 @@ function App() {
   } : legacyAmapConfig, [jsKey])
   const reloadMap = amapNeedsReload(amapConfig)
   const canCalculate = Boolean(amapConfig && !reloadMap && savedAmap?.routing_configured)
-  const spacing = samplingSpacings[precision]
+  const spacing = minimumSpacings[spacingIndex]
   const interval = contourIntervals[intervalIndex]
 
   const destination = useMemo(() => destinationFromInputs(lng, lat), [lng, lat])
   const params = useMemo<Parameters | null>(() => destination && ({
-    destination, radius_m: radius * 1000, spacing_m: spacing,
+    destination, min_spacing_m: spacing,
     max_duration_min: duration, contour_interval_min: interval,
-    max_points: 2000, max_requests: maxRequests,
-  }), [destination, radius, spacing, duration, interval, maxRequests])
+  }), [destination, spacing, duration, interval])
   const key = JSON.stringify(params)
   const currentEstimate = estimate?.key === key ? estimate.value : null
   const busy = starting || (job !== null && !terminal.has(job.status))
+  const liveJobId = job && !terminal.has(job.status) ? job.job_id : null
+  const completedPoints = useRef(0)
+  completedPoints.current = job?.completed_points ?? 0
+
+  useEffect(() => {
+    if (!samples || !liveJobId) return
+    const abort = new AbortController()
+    let cursor = 0
+    let timer = 0
+    let points: Sample[] = []
+    async function refresh() {
+      try {
+        while (!abort.signal.aborted && cursor < completedPoints.current) {
+          const page = await request<{ samples: Sample[]; next: number }>(
+            `${jobs}/${liveJobId}/samples?after=${cursor}`, undefined, abort.signal,
+          )
+          if (abort.signal.aborted || page.next <= cursor) break
+          points = [...points, ...page.samples]
+          cursor = page.next
+          setLiveSamples({ jobId: liveJobId!, points })
+        }
+      } catch {
+        // Retry on the next refresh; routing progress is independent of the overlay.
+      } finally {
+        if (!abort.signal.aborted) timer = window.setTimeout(() => void refresh(), 300)
+      }
+    }
+    void refresh()
+    return () => {
+      abort.abort()
+      window.clearTimeout(timer)
+    }
+  }, [liveJobId, samples])
 
   useEffect(() => {
     const abort = new AbortController()
@@ -84,6 +117,7 @@ function App() {
     return () => {
       abort.abort()
       stream.current?.close()
+      stream.current = null
     }
   }, [])
 
@@ -164,6 +198,8 @@ function App() {
     setStarting(true)
     setError('')
     setConnection('')
+    setPreview(null)
+    setLiveSamples(null)
     try {
       const created = await request<Job>(jobs, params)
       setJob(created)
@@ -171,12 +207,23 @@ function App() {
       const source = new EventSource('/api/v1' + path + '/events')
       stream.current?.close()
       stream.current = source
+      let previewRequest: AbortController | null = null
       source.onopen = () => setConnection('')
       source.onerror = () => setConnection('进度连接中断，正在重连…')
       async function update(event: MessageEvent<string>) {
         const next: Job = JSON.parse(event.data)
         setJob(next)
-        if (!terminal.has(next.status)) return
+        if (!terminal.has(next.status)) {
+          if (next.preview_ready && !previewRequest) {
+            const abort = new AbortController()
+            previewRequest = abort
+            request<Result>(path + '/preview', undefined, abort.signal)
+              .then(value => { if (!abort.signal.aborted && stream.current === source) setPreview(value) })
+              .catch(() => { if (!abort.signal.aborted) previewRequest = null })
+          }
+          return
+        }
+        previewRequest?.abort()
         source.close()
         setConnection('')
         if (next.error) setError(next.error.message)
@@ -187,8 +234,11 @@ function App() {
           } catch (cause) {
             setError(cause instanceof Error ? cause.message : '无法读取结果')
           } finally {
+            setPreview(null)
             setStarting(false)
           }
+        } else {
+          setPreview(null)
         }
       }
       for (const event of ['snapshot', 'progress', 'completed', 'failed', 'cancelled']) {
@@ -220,7 +270,7 @@ function App() {
     : '请填写 Web 服务 Key，以计算驾车等时圈。'
   const canCancel = job && !terminal.has(job.status)
   const jobStatus = <div role="status" className="job-status">
-    {job ? <span>{job.status === 'partial' ? '计算完成 · 存在缺测' : stages[job.stage]} · {job.completed_points}/{job.total_points} 点{job.requests_sent > 0 ? ` · ${job.requests_sent} 次请求` : ''}</span>
+    {job ? <span>{job.status === 'partial' ? '计算完成 · 部分结果' : stages[job.stage]} · {job.completed_points}{job.stage === 'expanding' ? '' : `/${job.total_points}`} 点{job.requests_sent > 0 ? ` · ${job.requests_sent} 次请求` : ''}</span>
       : starting && <span>正在提交任务…</span>}
     {connection && <span>{connection}</span>}
     {error && <span className="error">{error}</span>}
@@ -247,7 +297,8 @@ function App() {
 
   return (
     <main className="app">
-      <MapView center={center} radius={radius * 1000} result={result}
+      <MapView center={center} radius={duration <= 30 ? 7500 : duration <= 60 ? 15000 : 30000} result={preview ?? (busy ? null : result)}
+        liveSamples={liveJobId ? (liveSamples?.jobId === liveJobId ? liveSamples.points : []) : undefined}
         bands={bands} lines={lines} samples={samples} onSelect={choose} onMapInteract={dismissMapPanels}
         amapConfig={reloadMap ? null : amapConfig} layerControl={layerControl} onConfigure={() => setPanel('amap')}
         jobControl={!analysisOpen && (busy || connection || error || job?.status === 'cancelled') &&
@@ -296,22 +347,19 @@ function App() {
               {reloadMap && <p className="hint" role="status">刷新页面后应用新的高德底图配置。</p>}
 
               <div className="analysis-sliders">
-                <AnalysisSlider label="分析半径" value={radius} min={1} max={30} display={`${radius} km`} onChange={setRadius} />
-                <AnalysisSlider label="采样精度" value={precision} min={0} max={samplingSpacings.length - 1}
-                  display={spacing < 1000 ? `${spacing} m` : `${spacing / 1000} km`} onChange={setPrecision} />
                 <AnalysisSlider label="最长耗时" value={duration} min={15} max={120} step={5}
                   display={`${duration} 分钟`} onChange={setDuration} />
                 <AnalysisSlider label="等时线间隔" value={intervalIndex} min={0} max={contourIntervals.length - 1}
                   display={`${interval} 分钟`} onChange={setIntervalIndex} />
-                <AnalysisSlider label="批次预算" value={maxRequests} min={1} max={150}
-                  display={`${maxRequests} 批`} onChange={setMaxRequests} />
+                <AnalysisSlider label="最小间距" value={spacingIndex} min={0} max={minimumSpacings.length - 1}
+                  display={`${spacing} 米`} onChange={setSpacingIndex} />
               </div>
               <div className="analysis-estimate" aria-live="polite">
                 {currentEstimate
-                  ? <span>{currentEstimate.total_points} 个采样点 · 预计 {currentEstimate.estimated_requests} 次请求</span>
+                  ? null
                   : <span>{estimateError || (!canCalculate ? '配置高德后可生成等时圈。' : destination ? '等待预算估算…' : '请选择目的地')}</span>}
                 {currentEstimate && !currentEstimate.fits_budget &&
-                  <span className="error">超出预算，请缩小半径或降低精度。</span>}
+                  <span className="error">计算预算不足，无法开始采样。</span>}
               </div>
               <div className="actions">
                 <button type="button" className="primary generate" disabled={!canCalculate || busy || !currentEstimate?.fits_budget}

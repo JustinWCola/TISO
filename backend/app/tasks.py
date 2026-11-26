@@ -5,26 +5,47 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-from .core.field import Grid, build_result
+from .core.adaptive_geometry import build_adaptive_result
+from .core.field import Grid, sample_record
+from .core.hex_sampling import (
+    FRONTIER_BUFFER_S, INNER_RINGS, MAX_REFINEMENT_ROUNDS, MIN_SPACING_M, OUTER_STEP_MULTIPLIER,
+    HexSampler, Node, ring_nodes, ring_radius, seed_nodes, survey_outer,
+)
 from .providers.amap import AmapProvider
-from .providers.base import DRIVING_CAPABILITIES, TravelResult
+from .providers.base import DRIVING_CAPABILITIES, Point, TravelResult
 from .schemas import Parameters
 
 TERMINAL = {"completed", "partial", "failed", "cancelled"}
 LOG = logging.getLogger(__name__)
+EXPANSION_LIMIT_M = 60_000
 
 
 def now() -> datetime:
     return datetime.now(UTC)
 
 
-def estimate(grid: Grid) -> dict:
-    points = sum(1 for _ in grid.nodes())
-    batches = math.ceil((points - 1) / DRIVING_CAPABILITIES.max_origins)
+def routing_grid(params: Parameters) -> Grid:
+    expanding = params.radius_m is None
+    spacing = (1000 if params.max_duration_min <= 30 else 2000) if expanding else params.spacing_m
+    return Grid(params.model_copy(update={
+        "radius_m": EXPANSION_LIMIT_M if expanding else params.radius_m,
+        "spacing_m": max(spacing, params.min_spacing_m),
+    }))
+
+
+def estimate(params: Parameters) -> dict:
+    inner_points = 1 + 3 * INNER_RINGS * (INNER_RINGS + 1)
+    points = max(7, min(inner_points, params.max_points)) if params.radius_m is None else sum(
+        1 for _ in seed_nodes(routing_grid(params))
+    )
+    batch_size = DRIVING_CAPABILITIES.max_origins
+    batches = math.ceil((points - 1) / batch_size)
+    possible_extra = max(0, params.max_requests - batches) * batch_size
     return {
         "total_points": points, "route_points": points - 1, "batches": batches,
-        "estimated_requests": batches,
-        "fits_budget": points <= grid.params.max_points and batches <= grid.params.max_requests,
+        "estimated_requests": batches, "point_limit": min(params.max_points, points + possible_extra),
+        "request_limit": params.max_requests,
+        "fits_budget": points <= params.max_points and batches <= params.max_requests,
     }
 
 
@@ -43,6 +64,8 @@ class Job:
     observed_to: str | None = None
     error: dict | None = None
     result: dict | None = None
+    preview: dict | None = None
+    samples: list[dict] = field(default_factory=list)
     finished_at: datetime | None = None
     changed: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task | None = None
@@ -60,11 +83,12 @@ class Job:
             "job_id": self.id, "status": self.status, "stage": self.stage,
             "sequence": self.sequence, "total_points": self.total_points,
             "completed_points": self.completed_points, "requests_sent": self.requests_sent,
-            "provider_batches": self.provider_batches, "error": self.error,
+            "provider_batches": self.provider_batches, "error": self.error, "preview_ready": self.preview is not None,
         }
 
     def cancel(self) -> None:
         if self.status not in TERMINAL:
+            self.preview = None
             self.publish("cancelled", "cancelled")
             # An in-progress geometry thread must finish before another job starts.
             if self.task and not self.building_geometry:
@@ -96,79 +120,164 @@ class Jobs:
 
     async def run(self, job: Job) -> None:
         started_at = now()
-        grid = Grid(job.params)
+        grid = routing_grid(job.params)
+        expanding = job.params.radius_m is None
         job.publish("running", "sampling")
-        nodes = list(grid.nodes())
-        origins = [point for _, _, point in nodes if point.id != "0:0"]
-        destination = next(point for _, _, point in nodes if point.id == "0:0")
-        provider = self.amap
+        requested: set[str] = set()
         results = {"0:0": TravelResult("0:0", 0, 0, "ok", None, started_at)}
-        job.completed_points = 1
-        job.publish("running", "routing")
-
-        def before_request() -> None:
-            if job.requests_sent >= job.params.max_requests:
-                raise ValueError("已达外部请求预算，含重试")
-            job.requests_sent += 1
-            job.publish("running", "routing")
 
         try:
+            provider = self.amap
             if provider is None:
                 raise ValueError("高德 Web 服务未配置")
+            sampler = HexSampler(grid, expanding=expanding)
+            destination = sampler.points[(0, 0)]
             batch_size = provider.capabilities().max_origins
-            for offset in range(0, len(origins), batch_size):
-                if job.provider_batches >= job.params.max_requests:
-                    raise ValueError("已达请求预算")
-                batch = origins[offset:offset + batch_size]
-                job.provider_batches += 1
-                batch_results = await provider.travel_time_matrix(
-                    batch, destination, "driving", before_request=before_request,
-                )
-                for item in batch_results:
-                    results[item.point_id] = item
-                    observed_at = item.observed_at.isoformat()
-                    job.observed_from = min(job.observed_from or observed_at, observed_at)
-                    job.observed_to = max(job.observed_to or observed_at, observed_at)
-                job.completed_points = len(results)
-                job.publish("running", "routing")
+            job.completed_points = 1
+            job.samples.append(sample_record(destination, results[destination.id]))
 
-            if not any(item.status == "ok" for key, item in results.items() if key != "0:0"):
+            async def route(points: list[Point], stage: str) -> None:
+                job.publish("running", stage)
+                for offset in range(0, len(points), batch_size):
+                    if job.requests_sent >= job.params.max_requests:
+                        raise ValueError("已达外部请求预算，含重试")
+                    batch = points[offset:offset + batch_size]
+
+                    def before_request() -> None:
+                        if job.requests_sent >= job.params.max_requests:
+                            raise ValueError("已达外部请求预算，含重试")
+                        requested.update(point.id for point in batch)
+                        job.requests_sent += 1
+                        job.publish("running", stage)
+
+                    job.provider_batches += 1
+                    batch_results = await provider.travel_time_matrix(
+                        batch, destination, "driving", before_request=before_request,
+                    )
+                    batch_points = {point.id: point for point in batch}
+                    for item in batch_results:
+                        results[item.point_id] = item
+                        job.samples.append(sample_record(batch_points[item.point_id], item))
+                        observed_at = item.observed_at.isoformat()
+                        job.observed_from = min(job.observed_from or observed_at, observed_at)
+                        job.observed_to = max(job.observed_to or observed_at, observed_at)
+                    job.completed_points = len(results)
+                    job.publish("running", stage)
+
+            async def make_geometry() -> dict:
+                job.building_geometry = True
+                try:
+                    return await asyncio.to_thread(build_adaptive_result, sampler, results)
+                finally:
+                    job.building_geometry = False
+
+            def annotate(result: dict, *, preview: bool, refinement_error: str | None = None) -> dict:
+                warnings = []
+                if result["coverage"] < 0.9999:
+                    warnings.append("未知区域不填色。")
+                if result["boundary_truncated"]:
+                    warnings.append("外缘尚未确认超出最长耗时，等时圈可能仍向外延伸。" if expanding
+                                    else "可达区可能延伸到分析半径外。")
+                if refinement_error:
+                    warnings.append(f"加密提前结束：{refinement_error}")
+                if expansion_error:
+                    warnings.append(f"向外采样提前结束：{expansion_error}")
+                return {
+                    **result, "job_id": job.id, "provider": job.params.provider, "preview": preview,
+                    "coordinate_system": "GCJ-02", "geometry_format": "GCJ-02 map geometry (non-RFC 7946)",
+                    "sampling": job.params.sampling, "grid": "hexagonal",
+                    "direction": "origins_to_destination", "mode": "driving",
+                    "traffic_mode": job.params.traffic_mode, "destination": job.params.destination.model_dump(),
+                    "radius_m": radius, "spacing_m": grid.params.spacing_m,
+                    "min_spacing_m": job.params.min_spacing_m,
+                    "request_count": job.requests_sent, "route_points": len(requested),
+                    "provider_batches": job.provider_batches, "warnings": warnings,
+                    "started_at": started_at.isoformat(), "finished_at": now().isoformat(),
+                    "observed_from": job.observed_from, "observed_to": job.observed_to,
+                }
+
+            radius = grid.params.radius_m
+            expansion_error = None
+            if expanding:
+                async def visit(nodes: list[Node]) -> bool:
+                    nonlocal expansion_error
+                    pending = [node for node in dict.fromkeys(nodes)
+                               if (point := sampler.points.get(node)) is None or point.id not in results]
+                    if not pending:
+                        return True
+                    capacity = min(job.params.max_points - len(results),
+                                   (job.params.max_requests - job.requests_sent) * batch_size)
+                    points = [sampler.add_point(node) for node in pending[:capacity]]
+                    if not points:
+                        return False
+                    job.total_points = len(results) + len(points)
+                    try:
+                        await route(points, "expanding")
+                    except ValueError as error:
+                        expansion_error = str(error)
+                        return False
+                    return len(points) == len(pending)
+
+                initial_nodes = [node for index in range(1, INNER_RINGS + 1)
+                                 for node in ring_nodes(index, sampler.seed_step)]
+                if await visit(initial_nodes):
+                    coarse_step = OUTER_STEP_MULTIPLIER * sampler.seed_step
+                    sampler.frontier_closed = await survey_outer(
+                        grid.params.radius_m // (coarse_step * MIN_SPACING_M), coarse_step,
+                        sampler.levels[-1] + FRONTIER_BUFFER_S, visit, lambda: sampler.measurements(results),
+                    )
+                sampled = sampler.measurements(results)
+                radius = max(map(ring_radius, sampled)) * MIN_SPACING_M
+                sampler.seed_expanded_mesh(results)
+            else:
+                await route([point for point in sampler.points.values() if point != destination], "routing")
+            if not any(item.status == "ok" for key, item in results.items() if key != destination.id):
                 raise ValueError("未获得有效算路样本")
-            job.building_geometry = True
+
+            refinement_error = None
+            while sampler.rounds < MAX_REFINEMENT_ROUNDS:
+                request_capacity = (job.params.max_requests - job.requests_sent) * batch_size
+                point_capacity = job.params.max_points - len(results)
+                limit = min(request_capacity, point_capacity)
+                if limit <= 0:
+                    break
+                plan = sampler.plan(results, limit, batch_size=batch_size)
+                if not plan.points and not plan.cells:
+                    break
+                if job.preview is None:
+                    job.publish("running", "preview")
+                    draft = await make_geometry()
+                    if job.status == "cancelled":
+                        return
+                    job.preview = annotate(draft, preview=True)
+                job.total_points = len(results) + len(plan.points)
+                job.publish("running", "refining")
+                try:
+                    await route(plan.points, "refining")
+                except ValueError as error:
+                    refinement_error = str(error)
+                sampler.apply(plan, results)
+                if refinement_error:
+                    break
+
+            job.total_points = len(results)
             job.publish("running", "geometry")
-            result = await asyncio.to_thread(build_result, grid, nodes, results)
+            result = await make_geometry()
             if job.status == "cancelled":
                 return
-            warnings = []
-            if result["coverage"] < 0.9999:
-                warnings.append("未知区域不填色。")
-            if result["boundary_truncated"]:
-                warnings.append("可达区可能延伸到分析半径外。")
-            if result["geometry_repairs"]:
-                warnings.append("已修复部分等时面几何。")
-            result.update({
-                "job_id": job.id, "provider": job.params.provider,
-                "coordinate_system": "GCJ-02",
-                "geometry_format": "GCJ-02 map geometry (non-RFC 7946)",
-                "direction": "origins_to_destination", "mode": "driving",
-                "traffic_mode": job.params.traffic_mode, "destination": job.params.destination.model_dump(),
-                "radius_m": job.params.radius_m, "spacing_m": job.params.spacing_m,
-                "request_count": job.requests_sent, "route_points": len(origins),
-                "provider_batches": job.provider_batches, "warnings": warnings,
-                "started_at": started_at.isoformat(), "finished_at": now().isoformat(),
-                "observed_from": job.observed_from, "observed_to": job.observed_to,
-            })
-            job.result = result
-            status = "partial" if result["error_count"] or result["unreachable_count"] else "completed"
+            job.result = annotate(result, preview=False, refinement_error=refinement_error)
+            job.preview = None
+            status = ("partial" if expansion_error or refinement_error or result["error_count"] or result["unreachable_count"]
+                      or (expanding and result["boundary_truncated"]) else "completed")
             job.publish(status, "completed")
         except ValueError as error:
             if job.status != "cancelled":
+                job.preview = None
                 job.error = {"code": "job_failed", "message": str(error)}
                 job.publish("failed", "failed")
         except Exception as error:
             LOG.error("Job %s failed (%s)", job.id, type(error).__name__)
             if job.status != "cancelled":
+                job.preview = None
                 job.error = {"code": "job_failed", "message": "计算失败"}
                 job.publish("failed", "failed")
-        finally:
-            job.building_geometry = False

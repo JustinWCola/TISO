@@ -1,4 +1,4 @@
-import type { Coordinates, Destination, Result } from './api'
+import type { Coordinates, Destination, Result, Sample } from './api'
 
 type LngLat = { getLng(): number; getLat(): number }
 type MapEvent = { lnglat: LngLat }
@@ -115,8 +115,8 @@ export async function createAmap(
   const canvas = document.createElement('canvas')
   canvas.className = 'amap-travel-canvas'
   const context = canvas.getContext('2d')
-  let boundary = radiusPath(center, radius)
   let result: Result | null = null
+  let liveSamples: Sample[] | undefined
   let visible: TravelLayers = { bands: true, lines: true, samples: false }
 
   function project(point: Coordinates): Coordinates {
@@ -140,7 +140,7 @@ export async function createAmap(
     }
     context.setTransform(ratio, 0, 0, ratio, 0, 0)
     context.clearRect(0, 0, width, height)
-    paintTravelLayers(context, project, boundary, result, visible)
+    paintTravelLayers(context, project, result, visible, liveSamples)
   }
 
   const moveEvents = ['mapmove', 'zoomchange', 'moveend', 'zoomend', 'resize', 'complete']
@@ -189,13 +189,13 @@ export async function createAmap(
     fit(point: Destination, radius: number) {
       const location: Coordinates = [point.lng, point.lat]
       marker.setPosition(location)
-      boundary = radiusPath(point, radius)
       map.setZoomAndCenter(zoomForRadius(radius), location)
       paint()
     },
-    setResult(next: Result | null, layers: TravelLayers) {
+    setResult(next: Result | null, layers: TravelLayers, points?: Sample[]) {
       result = next
       visible = layers
+      liveSamples = points
       paint()
     },
     destroy() {
@@ -214,24 +214,12 @@ export async function createAmap(
 
 type TravelLayers = { bands: boolean; lines: boolean; samples: boolean }
 
-function radiusPath(center: Destination, radius: number): Coordinates[] {
-  const metersPerDegree = (Math.PI * 6_371_008.8) / 180
-  const longitudeScale = metersPerDegree * Math.cos(center.lat * Math.PI / 180)
-  return Array.from({ length: 64 }, (_, index) => {
-    const angle = index * 2 * Math.PI / 64
-    return [
-      center.lng + radius * Math.cos(angle) / longitudeScale,
-      center.lat + radius * Math.sin(angle) / metersPerDegree,
-    ]
-  })
-}
-
 function paintTravelLayers(
   context: CanvasRenderingContext2D,
   project: (point: Coordinates) => Coordinates,
-  boundary: Coordinates[],
   result: Result | null,
   visible: TravelLayers,
+  liveSamples?: Sample[],
 ) {
   function trace(path: Coordinates[], close: boolean) {
     path.forEach((point, index) => {
@@ -255,16 +243,7 @@ function paintTravelLayers(
     context.globalAlpha = 1
   }
 
-  context.beginPath()
-  trace(boundary, true)
-  context.strokeStyle = '#596673'
-  context.lineWidth = 1
-  context.setLineDash([3, 6])
-  context.stroke()
-  context.setLineDash([])
-  if (!result) return
-
-  if (visible.lines) {
+  if (result && visible.lines) {
     context.strokeStyle = '#324b51'
     context.lineWidth = 1.4
     for (const feature of result.contours.features) {
@@ -273,7 +252,7 @@ function paintTravelLayers(
       context.stroke()
     }
   }
-  if (visible.samples) for (const sample of result.samples) {
+  if (visible.samples) for (const sample of liveSamples ?? result?.samples ?? []) {
     const [x, y] = project(sample.coordinates)
     context.beginPath()
     context.arc(x, y, 2.2, 0, 2 * Math.PI)

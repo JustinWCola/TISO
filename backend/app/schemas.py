@@ -18,9 +18,10 @@ class Parameters(BaseModel):
     mode: Literal["driving"] = "driving"
     traffic_mode: Literal["current"] = "current"
     provider: Literal["amap"] = "amap"
-    sampling: Literal["uniform"] = "uniform"
-    radius_m: int = Field(default=15000, ge=1000, le=30000)
+    sampling: Literal["adaptive"] = "adaptive"
+    radius_m: int | None = Field(default=None, ge=1000, le=30000)
     spacing_m: Literal[500, 1000, 2000] = 1000
+    min_spacing_m: Literal[250, 500, 1000] = 250
     max_duration_min: int = Field(default=60, ge=15, le=120)
     contour_interval_min: Literal[5, 10, 15, 20, 30] = 15
     max_points: int = Field(default=2000, ge=1, le=2000)

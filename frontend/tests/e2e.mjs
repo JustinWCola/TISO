@@ -49,8 +49,8 @@ try {
   assert.ok(await generate.isDisabled())
   const generateBounds = await generate.boundingBox()
   for (const [name, initial, changed] of [
-    ['分析半径', '15 km', '16 km'], ['采样精度', '1 km', '500 m'], ['最长耗时', '60 分钟', '65 分钟'],
-    ['等时线间隔', '15 分钟', '20 分钟'],
+    ['最长耗时', '60 分钟', '65 分钟'], ['等时线间隔', '15 分钟', '20 分钟'],
+    ['最小间距', '250 米', '500 米'],
   ]) {
     const slider = page.getByRole('slider', { name })
     assert.ok((await slider.boundingBox()).y < generateBounds.y)
@@ -60,11 +60,7 @@ try {
     await slider.press('ArrowLeft')
   }
   assert.equal(await page.getByRole('button', { name: '分析设置', exact: true }).count(), 0)
-  const budget = page.getByRole('slider', { name: '批次预算' })
-  await budget.press('Home')
-  assert.equal(await budget.getAttribute('aria-valuetext'), '1 批')
-  await budget.press('End')
-  assert.equal(await budget.getAttribute('aria-valuetext'), '150 批')
+  assert.equal(await page.getByRole('slider').count(), 3)
   await page.setViewportSize({ width: 390, height: 720 })
   assert.equal(await page.locator('#analysis-controls .dock-content').evaluate(menu => {
     return getComputedStyle(menu).scrollbarWidth
@@ -146,9 +142,11 @@ try {
   }
   const ring = [[121.47, 31.23], [121.48, 31.23], [121.48, 31.24], [121.47, 31.24], [121.47, 31.23]]
   let keepRunning = false
-  const active = { ...done, job_id: jobId + '-running', status: 'running', stage: 'routing', completed_points: 8 }
+  const active = { ...done, job_id: jobId + '-running', status: 'running', stage: 'refining', completed_points: 8, preview_ready: true }
   await configured.route('**/api/v1/isochrones/jobs', route => {
-    assert.equal(route.request().postDataJSON().provider, undefined)
+    const { destination, ...options } = route.request().postDataJSON()
+    assert.ok(destination.lng && destination.lat)
+    assert.deepEqual(options, { max_duration_min: 60, contour_interval_min: 15, min_spacing_m: keepRunning ? 500 : 250 })
     return route.fulfill({ status: 202, json: keepRunning ? active : { ...done, status: 'queued' } })
   })
   await configured.route('**/api/v1/isochrones/jobs/' + active.job_id + '/events', route => route.fulfill({
@@ -158,7 +156,7 @@ try {
   await configured.route(jobPath + '/events', route => route.fulfill({
     contentType: 'text/event-stream', body: 'event: completed\ndata: ' + JSON.stringify(done) + '\n\n',
   }))
-  await configured.route(jobPath + '/result', route => route.fulfill({ json: {
+  const completedResult = {
     job_id: jobId,
     bands: { features: [15, 30, 45, 60].map((maximum, index) => ({
       properties: { minimum_min: index * 15, maximum_min: maximum }, geometry: { coordinates: [[ring]] },
@@ -167,7 +165,21 @@ try {
     samples: [],
     observed_from: '2026-11-25T03:14:27Z',
     observed_to: '2026-11-25T03:14:32Z',
-  } }))
+  }
+  await configured.route(jobPath + '/result', route => route.fulfill({ json: completedResult }))
+  let showPreview
+  const previewGate = new Promise(resolve => { showPreview = resolve })
+  await configured.route('**/api/v1/isochrones/jobs/' + active.job_id + '/preview', async route => {
+    await previewGate
+    await route.fulfill({ json: { ...completedResult, job_id: active.job_id, preview: true } })
+  })
+  const samplesPath = '/isochrones/jobs/' + active.job_id + '/samples'
+  await configured.route(url => url.pathname.endsWith(samplesPath), route => {
+    const after = Number(new URL(route.request().url()).searchParams.get('after'))
+    const point = { coordinates: [121.44, 31.225], duration_s: 720, status: 'ok' }
+    const next = after === 0 ? 1 : 8
+    return route.fulfill({ json: { samples: Array(next - after).fill(point), next } })
+  })
   await configured.goto(base)
   await configured.locator('.amap[data-sdk-initialized="yes"]').waitFor()
   assert.equal(await configured.getByRole('button', { name: '高德底图', exact: true }).count(), 0)
@@ -247,9 +259,25 @@ try {
 
   keepRunning = true
   await configured.locator('#analysis-toggle').click()
+  await configured.getByRole('slider', { name: '最小间距' }).press('ArrowRight')
   await configured.getByRole('button', { name: '生成等时圈', exact: true }).click()
   const progress = configured.locator('.map-job')
   await progress.getByRole('button', { name: '取消', exact: true }).waitFor()
+  assert.equal(await legend.count(), 0)
+  assert.equal(await alphaAt(115, 340), 0)
+  await configured.locator('#layers-toggle').click()
+  const liveBatch = configured.waitForResponse(response => response.url().endsWith(samplesPath + '?after=1'))
+  const sampleToggle = configured.getByRole('checkbox', { name: '采样点' })
+  await sampleToggle.check()
+  await liveBatch
+  await configured.waitForFunction(() => document.querySelector('.amap canvas')
+    .getContext('2d').getImageData(115, 340, 1, 1).data[3] > 0)
+  assert.equal(await legend.count(), 0)
+  await sampleToggle.uncheck()
+  assert.equal(await alphaAt(115, 340), 0)
+  await configured.locator('#layers-toggle').click()
+  showPreview()
+  await legend.getByText('初步等时圈 · 正在加密', { exact: true }).waitFor()
   for (const width of [632, 390]) {
     await configured.setViewportSize({ width, height: 690 })
     const bounds = await configured.locator('.map-bottom').evaluate(row =>

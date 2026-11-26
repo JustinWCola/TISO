@@ -2,11 +2,12 @@ import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { bandColor, createAmap } from './amap'
 import type { AmapConfig } from './amap'
-import type { Destination, Result } from './api'
+import type { Destination, Result, Sample } from './api'
 import Icon from './Icon'
 
 type Props = {
   center: Destination; radius: number; result: Result | null
+  liveSamples?: Sample[]
   bands: boolean; lines: boolean; samples: boolean
   amapConfig: AmapConfig | null
   layerControl: ReactNode
@@ -64,10 +65,10 @@ export default function MapView(props: Props) {
     return () => window.clearTimeout(timer)
   }, [props.center.lng, props.center.lat, props.radius])
 
-  const { result, bands, lines, samples } = props
+  const { result, bands, lines, samples, liveSamples } = props
   useEffect(() => {
-    if (nativeReady) adapter.current?.setResult(result, { bands, lines, samples })
-  }, [nativeReady, result, bands, lines, samples])
+    if (nativeReady) adapter.current?.setResult(result, { bands, lines, samples }, liveSamples)
+  }, [nativeReady, result, bands, lines, samples, liveSamples])
 
   return (
     <section className={`map${showAmap ? ' is-amap' : ''}`} aria-label="交通可达性地图">
@@ -108,7 +109,9 @@ function TravelLegend({ result }: { result: Result }) {
   const from = result.observed_from ? beijingTime.format(new Date(result.observed_from)) : null
   const to = result.observed_to ? beijingTime.format(new Date(result.observed_to)) : null
   return <aside className="legend" aria-label="等时圈图例">
+    {result.preview && <p className="legend-time">初步等时圈 · 正在加密</p>}
     {from && <p className="legend-time">算路时间 {from}{to && from !== to ? `–${to}` : ''}（北京时间）</p>}
+    {!result.preview && result.boundary_truncated && <p className="legend-time">外缘未确认 · 结果可能向外延伸</p>}
     {count > 0 && <div className="legend-scale" style={{ gridTemplateColumns: `repeat(${count}, minmax(0, 1fr))` }}>
       {features.map(({ properties }, index) => <div className="legend-segment" key={properties.maximum_min}>
         <span style={{ backgroundColor: bandColor(index, count) }}
