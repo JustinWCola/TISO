@@ -253,6 +253,7 @@ function paintTravelLayers(
     }
   }
   if (visible.samples) for (const sample of liveSamples ?? result?.samples ?? []) {
+    if (sample.status === 'outside_scope') continue
     const [x, y] = project(sample.coordinates)
     context.beginPath()
     context.arc(x, y, 2.2, 0, 2 * Math.PI)

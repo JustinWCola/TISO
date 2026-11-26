@@ -32,7 +32,7 @@ class TravelResult:
     point_id: str
     duration_s: float | None
     distance_m: float | None
-    status: Literal["ok", "unreachable", "error"]
+    status: Literal["ok", "unreachable", "error", "outside_scope"]
     provider_error: str | None
     observed_at: datetime
 

@@ -8,11 +8,12 @@ import httpx
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
-from shapely.geometry import Point as GeometryPoint, shape
+from shapely.geometry import Point as GeometryPoint, box, shape
 from shapely.ops import unary_union
 
 from app.core.field import Grid, build_geometry
 from app.core.hex_sampling import meters, ring_radius
+from app.core.mainland import inside_mainland, mainland_boundary
 from app.main import app
 from app.providers.amap import AmapProvider
 from app.providers.base import Point, TravelResult
@@ -207,6 +208,8 @@ def test_budget_rejection_and_idempotent_cancellation(amap_client):
     ("corridor", 150, False), ("corridor", 2, True), ("missing", 150, True), ("pocket", 150, False),
 ])
 def test_expanding_hex_job_and_sample_cursor(amap_client, monkeypatch, case, max_requests, truncated):
+    monkeypatch.setattr("app.tasks.inside_mainland", lambda _lng, _lat: True)
+    monkeypatch.setattr("app.tasks.local_mainland", lambda _grid: box(-100_000, -100_000, 100_000, 100_000))
     probes = []
     batches = []
     observed = datetime(2026, 11, 25, tzinfo=UTC)
@@ -318,6 +321,121 @@ def test_refinement_preview_survives_retry_budget_and_keeps_coarse_result(amap_c
     assert result["bands"]["features"]
     assert any("加密提前结束" in warning for warning in result["warnings"])
     assert set(routing_calls[0].split("|")).isdisjoint(routing_calls[1].split("|"))
+
+
+def test_outer_routing_error_reports_reason_and_keeps_inner_samples(amap_client, monkeypatch):
+    batches = []
+    successful_response = app.state.amap_client.get
+
+    async def upstream(url, *, params):
+        batches.append(params["origins"].split("|"))
+        if len(batches) == 2:
+            return httpx.Response(200, json={"status": "0", "infocode": "10044"})
+        return await successful_response(url, params=params)
+
+    monkeypatch.setattr(app.state.amap_client, "get", upstream)
+    created = amap_client.post(BASE + "/jobs", json={
+        "destination": DESTINATION, "max_duration_min": 30, "min_spacing_m": 1000,
+    })
+    path = BASE + "/jobs/" + created.json()["job_id"]
+    assert '"status": "partial"' in amap_client.get(path + "/events").text
+    result = amap_client.get(path + "/result").json()
+    assert [len(batch) for batch in batches] == [18, 12]
+    assert result["sample_count"] == 19 and result["request_count"] == 2
+    assert result["radius_m"] == 2000 and result["boundary_truncated"]
+    assert "向外采样提前结束：Amap business error (infocode 10044)" in result["warnings"]
+
+
+@pytest.mark.parametrize("max_requests", [2, 150])
+def test_outer_routing_filters_coast_before_requests_and_clips_bands(amap_client, monkeypatch, max_requests):
+    lng, lat = DESTINATION.values()
+    grid = Grid(Parameters(destination=DESTINATION))
+    coast, _ = grid.coordinates(2500, 0)
+    batches = []
+    monkeypatch.setattr("app.tasks.inside_mainland", lambda x, _y: x < coast)
+    monkeypatch.setattr("app.tasks.local_mainland", lambda _grid: box(-100_000, -100_000, 2500, 100_000))
+
+    async def coastal_distance(url, *, params):
+        origins = [tuple(map(float, point.split(","))) for point in params["origins"].split("|")]
+        assert tuple(map(float, params["destination"].split(","))) == (lng, lat)
+        batches.append(origins)
+        app.state.jobs.amap.next_request_at = 0.0
+        assert all(x < coast for x, _ in origins)
+        return httpx.Response(200, json={"status": "1", "results": [
+            {"origin_id": i, "dest_id": 1, "duration": distance * 0.35, "distance": distance}
+            for i, (x, y) in enumerate(origins, 1)
+            for distance in [math.hypot((x - lng) * 95_000, (y - lat) * 111_000)]
+        ]})
+
+    monkeypatch.setattr(app.state.amap_client, "get", coastal_distance)
+    created = amap_client.post(BASE + "/jobs", json={
+        "destination": DESTINATION, "max_duration_min": 30,
+        "min_spacing_m": 1000, "max_requests": max_requests,
+    })
+    path = BASE + "/jobs/" + created.json()["job_id"]
+    events = amap_client.get(path + "/events").text
+    result = amap_client.get(path + "/result").json()
+    assert result["request_count"] == len(batches) <= max_requests
+    assert result["outside_scope_count"] > 0
+    assert result["unreachable_count"] == 0
+    assert all(item["duration_s"] is None and item["coordinates"][0] >= coast
+               for item in result["samples"] if item["status"] == "outside_scope")
+    bands = unary_union([shape(feature["geometry"]) for feature in result["bands"]["features"]])
+    assert bands.bounds[2] <= coast + 1e-8
+    if max_requests == 2:
+        assert '"status": "partial"' in events
+        assert len(batches) == max_requests
+        assert any("已达外部请求预算" in warning for warning in result["warnings"])
+        return
+    assert '"status": "completed"' in events
+    assert not result["boundary_truncated"]
+    assert not any("向外采样提前结束" in warning for warning in result["warnings"])
+    assert any(item["status"] == "ok" and item["coordinates"][0] < lng - 6000 / 95_000
+               for item in result["samples"])
+
+
+def test_destination_outside_mainland_is_rejected_before_routing(amap_client, monkeypatch):
+    async def unexpected_request(*args, **kwargs):
+        pytest.fail("outside destination triggered an external request")
+
+    monkeypatch.setattr(app.state.amap_client, "get", unexpected_request)
+    params = {"destination": {"lng": 114.174, "lat": 22.282}}
+    for endpoint in ("/estimate", "/jobs"):
+        response = amap_client.post(BASE + endpoint, json=params)
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "destination_outside_scope"
+
+
+def test_shenzhen_coastal_job_uses_bundled_boundary(amap_client, monkeypatch):
+    batches = []
+
+    async def land_routes(url, *, params):
+        lng, lat = map(float, params["destination"].split(","))
+        points = [tuple(map(float, origin.split(","))) for origin in params["origins"].split("|")]
+        assert all(inside_mainland(x, y) for x, y in points)
+        batches.append(points)
+        app.state.jobs.amap.next_request_at = 0.0
+        return httpx.Response(200, json={"status": "1", "results": [
+            {"origin_id": i, "dest_id": 1, "duration": distance * 0.4, "distance": distance}
+            for i, (x, y) in enumerate(points, 1)
+            for distance in [math.hypot((x - lng) * 100_000, (y - lat) * 111_000)]
+        ]})
+
+    monkeypatch.setattr(app.state.amap_client, "get", land_routes)
+    response = amap_client.post(BASE + "/jobs", json={
+        "destination": {"lng": 113.945, "lat": 22.522}, "max_duration_min": 15, "min_spacing_m": 1000,
+    })
+    assert response.status_code == 202
+    path = BASE + "/jobs/" + response.json()["job_id"]
+    assert '"status": "completed"' in amap_client.get(path + "/events").text
+    result = amap_client.get(path + "/result").json()
+    assert result["outside_scope_count"] > 0
+    assert result["route_points"] == sum(map(len, batches))
+    assert result["request_count"] == len(batches)
+    boundary = mainland_boundary().buffer(0.0000002)
+    for key in ("bands", "contours"):
+        assert result[key]["features"]
+        assert all(shape(feature["geometry"]).difference(boundary).is_empty for feature in result[key]["features"])
 
 
 def test_amap_request_is_reverse_and_restores_result_order():

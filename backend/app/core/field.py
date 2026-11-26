@@ -28,6 +28,11 @@ class Grid:
         longitude_scale = METRES_PER_DEGREE * math.cos(math.radians(center.lat))
         return center.lng + x / longitude_scale, center.lat + y / METRES_PER_DEGREE
 
+    def local_meters(self, lng: float, lat: float) -> tuple[float, float]:
+        center = self.params.destination
+        longitude_scale = METRES_PER_DEGREE * math.cos(math.radians(center.lat))
+        return (lng - center.lng) * longitude_scale, (lat - center.lat) * METRES_PER_DEGREE
+
     def nodes(self) -> Iterable[tuple[int, int, Point]]:
         spacing = self.params.spacing_m
         # One cell of padding in both axes allows clipping across the circular edge.
@@ -123,7 +128,7 @@ def sample_record(point: Point, result: TravelResult) -> dict:
 
 def sample_payload(points: Iterable[Point], results: dict[str, TravelResult], geometry: GeometryResult) -> dict:
     samples = []
-    counts = {"ok": 0, "unreachable": 0, "error": 0}
+    counts = {"ok": 0, "unreachable": 0, "error": 0, "outside_scope": 0}
     for point in points:
         result = results[point.id]
         counts[result.status] += 1
@@ -135,4 +140,5 @@ def sample_payload(points: Iterable[Point], results: dict[str, TravelResult], ge
         "coverage": coverage, "boundary_truncated": truncated, "geometry_repairs": repairs,
         "sample_count": len(samples), "success_count": counts["ok"],
         "unreachable_count": counts["unreachable"], "error_count": counts["error"],
+        "outside_scope_count": counts["outside_scope"],
     }

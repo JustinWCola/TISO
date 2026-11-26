@@ -4,12 +4,13 @@ from datetime import UTC, datetime
 
 import pytest
 from shapely.geometry import Point as GeometryPoint
-from shapely.geometry import shape
+from shapely.geometry import box, shape
 from shapely.ops import unary_union
 
 from app.core.adaptive_geometry import build_adaptive_result, known_facets
 from app.core.field import Grid
 from app.core.hex_sampling import HexSampler, meters, ring_radius, ring_sectors, seed_nodes, survey_outer
+from app.core.mainland import inside_mainland, mainland_boundary
 from app.providers.base import TravelResult
 from app.schemas import Parameters
 
@@ -73,6 +74,31 @@ def test_missing_hex_sample_remains_unpainted():
     assert result["error_count"] == 1
     assert not area.covers(GeometryPoint(missing.lon, missing.lat))
     assert area.covers(GeometryPoint(*sampler.grid.coordinates(-2000, 0)))
+
+
+def test_mainland_dataset_is_closed_and_excludes_sea_and_outside_places():
+    boundary = mainland_boundary()
+    assert boundary.is_valid and boundary.geom_type == "MultiPolygon"
+    assert all(part.exterior.is_ring and all(ring.is_ring for ring in part.interiors) for part in boundary.geoms)
+    assert inside_mainland(114.063, 22.548)  # Shenzhen
+    assert inside_mainland(110.350, 20.030)  # Hainan
+    for lng, lat in [(114.174, 22.282), (113.551, 22.198), (121.5654, 25.033), (114.290, 22.100)]:
+        assert not inside_mainland(lng, lat)
+
+
+def test_mainland_mask_clips_bands_and_contours_across_water_gap():
+    sampler = seed()
+    results = {}
+    sample(sampler, sampler.points.values(), results, lambda _x, y: 850 + 0.12 * y)
+    water = box(400, -5000, 650, 5000)
+    land = box(-5000, -5000, 5000, 5000).difference(water)
+    clipped = build_adaptive_result(sampler, results, land)
+    low, high = sampler.grid.coordinates(420, -500), sampler.grid.coordinates(630, 600)
+    water_in_view = box(*low, *high)
+    for key in ("bands", "contours"):
+        original = build_adaptive_result(sampler, results)[key]["features"]
+        assert any(shape(feature["geometry"]).intersects(water_in_view) for feature in original)
+        assert all(not shape(feature["geometry"]).intersects(water_in_view) for feature in clipped[key]["features"])
 
 
 def test_unflagged_hex_region_is_probed_and_hidden_gradient_gets_refined():

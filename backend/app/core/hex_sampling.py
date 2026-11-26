@@ -63,6 +63,7 @@ async def survey_outer(
     max_ring: int, step: int, duration_limit: int,
     visit: Callable[[list[Node]], Awaitable[bool]],
     measurements: Callable[[], Measurements],
+    is_unreachable: Callable[[Node], bool] | None = None,
 ) -> bool:
     safe_checks = [0] * 6
     next_probe = [2] * 6
@@ -77,6 +78,8 @@ async def survey_outer(
         values = measurements()
 
         def near(node: Node) -> bool:
+            if is_unreachable is not None and is_unreachable(node):
+                return False
             value = values.get(node)
             return value is None or value <= duration_limit
 

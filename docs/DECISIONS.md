@@ -16,6 +16,11 @@
 - 高德适配器通过替身 HTTP 响应验证方向和顺序恢复。使用授权账号曾验证底图、地点搜索，以及一次反向批量请求返回 20 个有效起点。P2 对比使用离线数据。
 - 默认单进程、单任务，结果存放在内存中。Compose 只绑定回环，公网认证与 HTTPS 由部署方提供。
 
+## 算路范围数据
+
+- `backend/app/core/data/mainland_gcj02.wkb.gz` 保存一个有效的 GCJ‑02 MultiPolygon，含 63 个闭环组成部分。WGS‑84 原始数据使用 Natural Earth 1:10m v5.1.1 的 `ne_10m_admin_0_map_units` 和 `ne_10m_ocean`。选择 `GU_A3=CHN`，去掉海洋以及港澳台单元，再对边界线段以 0.01° 上限加密、以 coordtransform 转成 GCJ‑02 并保留六位小数。海南和来源覆盖的沿海岛屿保留。[Natural Earth 行政单元](https://www.naturalearthdata.com/downloads/10m-cultural-vectors/) · [海洋多边形](https://www.naturalearthdata.com/downloads/10m-physical-vectors/10m-ocean/) · [坐标转换](https://github.com/wandergis/coordtransform)
+- 多边形约束高德驾车请求的范围和结果绘制。输入按与高德一致的六位小数检查严格内部。多边形是小比例尺数据，填海新区、窄水道和贴岸位置仍受源数据精度影响。用于算路范围筛选。
+
 ## P2 离线基准
 
 合批与位置误差加密上线前后，用 15 分钟阈值和 500 米最小间距对照了三个合成场。平滑场由 29 批降至 27 批，快速通道为 52 批，孤立可达区为 15 批。三组对解析轮廓的最大双向偏差取整后分别为 5、95、26 米，与原策略持平。另有合批回归验证一组内侧补采和外圈探测由两批合为一批。位置误差和请求节省仍需真实路况验证。

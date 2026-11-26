@@ -3,6 +3,7 @@ from collections import defaultdict
 
 from shapely import intersection, line_merge, union_all
 from shapely.geometry import Point as GeometryPoint, Polygon, mapping
+from shapely.geometry.base import BaseGeometry
 from shapely.geometry.polygon import orient
 
 from app.providers.base import TravelResult
@@ -76,13 +77,16 @@ def clip(vertices: list[Vertex], level: float, *, below: bool) -> list[Vertex]:
     return result
 
 
-def build_adaptive_geometry(sampler: HexSampler, facets: list[Facet]) -> GeometryResult:
+def build_adaptive_geometry(
+    sampler: HexSampler, facets: list[Facet], mainland: BaseGeometry | None = None,
+) -> GeometryResult:
     grid = sampler.grid
     domain = (union_all([Polygon([meters(node) for node in cell]) for cell in sampler.leaves], grid_size=PRECISION_M)
               if sampler.expanding
               else GeometryPoint(0, 0).buffer(grid.params.radius_m, quad_segs=64))
+    land = intersection(domain, mainland, grid_size=PRECISION_M) if mainland is not None else domain
     support = union_all([Polygon([point[:2] for point in facet]) for facet in facets], grid_size=PRECISION_M)
-    coverage = min(1.0, support.intersection(domain).area / domain.area) if domain.area else 0.0
+    coverage = min(1.0, support.intersection(land).area / land.area) if land.area else 0.0
     ranges = [(min(a[2] for a in facet), max(a[2] for a in facet), facet) for facet in facets]
     contours, bands = [], []
     truncated = not sampler.frontier_closed
@@ -107,14 +111,14 @@ def build_adaptive_geometry(sampler: HexSampler, facets: list[Facet]) -> Geometr
                     polygons.append(polygon)
 
         if segments:
-            stitched = intersection(union_all(segments, grid_size=PRECISION_M), domain, grid_size=PRECISION_M)
+            stitched = intersection(union_all(segments, grid_size=PRECISION_M), land, grid_size=PRECISION_M)
             lines = [[grid.coordinates(x, y) for x, y in line.coords] for line in parts(line_merge(stitched), "LineString")]
             if lines:
                 contours.append(geometry_feature("MultiLineString", lines, duration_min=maximum / 60))
         if polygons:
             stitched = union_all(polygons, grid_size=PRECISION_M)
-            truncated |= stitched.intersects(boundary)
-            clipped = intersection(stitched, domain, grid_size=PRECISION_M)
+            clipped = intersection(stitched, land, grid_size=PRECISION_M)
+            truncated |= clipped.intersects(boundary)
             rings = [
                 [[grid.coordinates(x, y) for x, y in ring] for ring in mapping(orient(polygon, sign=1))["coordinates"]]
                 for polygon in parts(clipped, "Polygon")
@@ -124,11 +128,13 @@ def build_adaptive_geometry(sampler: HexSampler, facets: list[Facet]) -> Geometr
     return feature_collection(contours), feature_collection(bands), coverage, truncated, 0
 
 
-def build_adaptive_result(sampler: HexSampler, results: dict[str, TravelResult]) -> dict:
+def build_adaptive_result(
+    sampler: HexSampler, results: dict[str, TravelResult], mainland: BaseGeometry | None = None,
+) -> dict:
     facets = known_facets(sampler, results)
     nodes = [point for point in sampler.points.values() if point.id in results]
     return {
-        **sample_payload(nodes, results, build_adaptive_geometry(sampler, facets)),
+        **sample_payload(nodes, results, build_adaptive_geometry(sampler, facets, mainland)),
         "minimum_spacing_m": min((side(cell) * MIN_SPACING_M for cell in sampler.leaves),
                                  default=sampler.grid.params.spacing_m),
         "refinement_rounds": sampler.rounds,

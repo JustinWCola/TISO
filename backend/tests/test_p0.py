@@ -30,6 +30,15 @@ def test_amap_rejects_business_error():
         parse_results({"status": "0", "infocode": "10003"}, ORIGINS)
 
 
+def test_amap_marks_known_per_point_distance_errors_unreachable():
+    payload = {"status": "1", "results": [
+        {"origin_id": str(index), "code": code, "duration": "0"}
+        for index, code in enumerate((1, "2", 3), start=1)
+    ]}
+    results = parse_results(payload, ORIGINS)
+    assert all(item["status"] == "unreachable" and item.get("duration_s") is None for item in results)
+
+
 @pytest.mark.parametrize(("args", "status"), [([], 0), (["--live"], 2)])
 def test_amap_requires_live_opt_in_and_budget(args, status):
     run = subprocess.run(

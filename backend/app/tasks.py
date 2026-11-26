@@ -9,8 +9,9 @@ from .core.adaptive_geometry import build_adaptive_result
 from .core.field import Grid, sample_record
 from .core.hex_sampling import (
     FRONTIER_BUFFER_S, INNER_RINGS, MAX_REFINEMENT_ROUNDS, MIN_SPACING_M, OUTER_STEP_MULTIPLIER,
-    HexSampler, Node, ring_nodes, ring_radius, seed_nodes, survey_outer,
+    HexSampler, Node, meters, ring_nodes, ring_radius, seed_nodes, survey_outer,
 )
+from .core.mainland import inside_mainland, local_mainland
 from .providers.amap import AmapProvider
 from .providers.base import DRIVING_CAPABILITIES, Point, TravelResult
 from .schemas import Parameters
@@ -34,19 +35,25 @@ def routing_grid(params: Parameters) -> Grid:
 
 
 def estimate(params: Parameters) -> dict:
-    inner_points = 1 + 3 * INNER_RINGS * (INNER_RINGS + 1)
-    points = max(7, min(inner_points, params.max_points)) if params.radius_m is None else sum(
-        1 for _ in seed_nodes(routing_grid(params))
-    )
+    grid = routing_grid(params)
+    nodes = ([(0, 0), *inner_nodes(grid)][:max(7, params.max_points)]
+             if params.radius_m is None else list(seed_nodes(grid)))
+    points = len(nodes)
+    route_points = sum(node != (0, 0) and inside_mainland(*grid.coordinates(*meters(node))) for node in nodes)
     batch_size = DRIVING_CAPABILITIES.max_origins
-    batches = math.ceil((points - 1) / batch_size)
+    batches = math.ceil(route_points / batch_size)
     possible_extra = max(0, params.max_requests - batches) * batch_size
     return {
-        "total_points": points, "route_points": points - 1, "batches": batches,
+        "total_points": points, "route_points": route_points, "batches": batches,
         "estimated_requests": batches, "point_limit": min(params.max_points, points + possible_extra),
         "request_limit": params.max_requests,
         "fits_budget": points <= params.max_points and batches <= params.max_requests,
     }
+
+
+def inner_nodes(grid: Grid) -> list[Node]:
+    step = grid.params.spacing_m // MIN_SPACING_M
+    return [node for index in range(1, INNER_RINGS + 1) for node in ring_nodes(index, step)]
 
 
 @dataclass
@@ -132,16 +139,31 @@ class Jobs:
                 raise ValueError("高德 Web 服务未配置")
             sampler = HexSampler(grid, expanding=expanding)
             destination = sampler.points[(0, 0)]
+            if not inside_mainland(destination.lon, destination.lat):
+                raise ValueError("目的地须位于中国大陆陆地区域")
+            mainland = await asyncio.to_thread(local_mainland, grid)
             batch_size = provider.capabilities().max_origins
             job.completed_points = 1
             job.samples.append(sample_record(destination, results[destination.id]))
 
             async def route(points: list[Point], stage: str) -> None:
                 job.publish("running", stage)
-                for offset in range(0, len(points), batch_size):
+                eligible = []
+                for point in points:
+                    if inside_mainland(point.lon, point.lat):
+                        eligible.append(point)
+                        continue
+                    item = TravelResult(point.id, None, None, "outside_scope", "outside_mainland", now())
+                    results[point.id] = item
+                    job.samples.append(sample_record(point, item))
+                if len(eligible) != len(points):
+                    job.completed_points = len(results)
+                    job.publish("running", stage)
+
+                for offset in range(0, len(eligible), batch_size):
                     if job.requests_sent >= job.params.max_requests:
                         raise ValueError("已达外部请求预算，含重试")
-                    batch = points[offset:offset + batch_size]
+                    batch = eligible[offset:offset + batch_size]
 
                     def before_request() -> None:
                         if job.requests_sent >= job.params.max_requests:
@@ -167,7 +189,7 @@ class Jobs:
             async def make_geometry() -> dict:
                 job.building_geometry = True
                 try:
-                    return await asyncio.to_thread(build_adaptive_result, sampler, results)
+                    return await asyncio.to_thread(build_adaptive_result, sampler, results, mainland)
                 finally:
                     job.building_geometry = False
 
@@ -199,14 +221,18 @@ class Jobs:
             radius = grid.params.radius_m
             expansion_error = None
             if expanding:
+                def is_unreachable(node: Node) -> bool:
+                    point = sampler.points.get(node)
+                    item = results.get(point.id) if point is not None else None
+                    return item is not None and item.status in {"unreachable", "outside_scope"}
+
                 async def visit(nodes: list[Node]) -> bool:
                     nonlocal expansion_error
                     pending = [node for node in dict.fromkeys(nodes)
                                if (point := sampler.points.get(node)) is None or point.id not in results]
                     if not pending:
                         return True
-                    capacity = min(job.params.max_points - len(results),
-                                   (job.params.max_requests - job.requests_sent) * batch_size)
+                    capacity = job.params.max_points - len(results)
                     points = [sampler.add_point(node) for node in pending[:capacity]]
                     if not points:
                         return False
@@ -218,13 +244,12 @@ class Jobs:
                         return False
                     return len(points) == len(pending)
 
-                initial_nodes = [node for index in range(1, INNER_RINGS + 1)
-                                 for node in ring_nodes(index, sampler.seed_step)]
-                if await visit(initial_nodes):
+                if await visit(inner_nodes(grid)):
                     coarse_step = OUTER_STEP_MULTIPLIER * sampler.seed_step
                     sampler.frontier_closed = await survey_outer(
                         grid.params.radius_m // (coarse_step * MIN_SPACING_M), coarse_step,
                         sampler.levels[-1] + FRONTIER_BUFFER_S, visit, lambda: sampler.measurements(results),
+                        is_unreachable=is_unreachable,
                     )
                 sampled = sampler.measurements(results)
                 radius = max(map(ring_radius, sampled)) * MIN_SPACING_M

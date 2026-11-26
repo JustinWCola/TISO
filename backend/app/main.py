@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .amap_settings import read_settings, router as amap_settings_router, routing_key
+from .core.mainland import inside_mainland
 from .providers.amap import AmapProvider
 from .schemas import Parameters
 from .tasks import TERMINAL, Jobs, estimate
@@ -79,7 +80,13 @@ async def capabilities(request: Request):
 
 @app.post(f"{PREFIX}/isochrones/estimate")
 async def estimate_job(params: Parameters):
+    validate_destination(params)
     return estimate(params)
+
+
+def validate_destination(params: Parameters) -> None:
+    if not inside_mainland(params.destination.lng, params.destination.lat):
+        fail(422, "destination_outside_scope", "目的地须位于中国大陆陆地区域")
 
 
 @app.post(JOBS, status_code=202)
@@ -88,6 +95,7 @@ async def create_job(params: Parameters, request: Request):
     manager.prune()
     if manager.amap is None:
         fail(422, "provider_unavailable", "请在高德设置中配置 Web 服务 Key")
+    validate_destination(params)
     budget = estimate(params)
     if not budget["fits_budget"]:
         fail(422, "budget_exceeded", "超出计算预算", **budget)

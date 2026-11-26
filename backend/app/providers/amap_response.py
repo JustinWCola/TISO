@@ -32,6 +32,10 @@ def parse_results(payload: object, origins: list[Point]) -> list[dict]:
         index = int(origin_id)
         if index in by_index:
             raise ValueError("Duplicate origin_id in Amap result")
+        code = str(item.get("code"))
+        if code in {"1", "2", "3"}:
+            by_index[index] = {"status": "unreachable", "provider_error": f"distance_point_error_{code}"}
+            continue
         try:
             if str(item.get("dest_id")) != "1" or item.get("code") not in (None, 0, "0"):
                 raise ValueError("unexpected destination or item error code")
