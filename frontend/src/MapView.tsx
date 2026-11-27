@@ -1,12 +1,14 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { bandColor, createAmap } from './amap'
 import type { AmapConfig } from './amap'
 import type { Destination, Result, Sample } from './api'
 import Icon from './Icon'
+import { renderMap } from './schematicMap'
 
 type Props = {
   center: Destination; radius: number; result: Result | null
+  notice: ReactNode
   liveSamples?: Sample[]
   bands: boolean; lines: boolean; samples: boolean
   amapConfig: AmapConfig | null
@@ -16,6 +18,40 @@ type Props = {
   onConfigure: () => void
   onSelect: (destination: Destination) => void
   onMapInteract: () => void
+}
+
+function AnimatedPanel({ children, wide = false }: { children: ReactNode; wide?: boolean }) {
+  const [retained, setRetained] = useState<ReactNode>(null)
+  const visible = Boolean(children)
+
+  useLayoutEffect(() => {
+    if (visible) setRetained(children)
+  }, [children, visible])
+
+  if (!visible && !retained) return null
+  const content = visible ? children : retained
+  return <div className={`map-feedback-panel${wide ? ' map-feedback-legend' : ''}`}
+    data-exiting={!visible} inert={!visible}
+    onAnimationEnd={event => {
+      if (!visible && event.target === event.currentTarget && event.animationName === 'feedback-exit') {
+        setRetained(null)
+      }
+    }}>
+    {wide ? <div className="map-feedback-legend-content">{content}</div> : content}
+  </div>
+}
+
+function OfflineMap({ result }: { result: Result }) {
+  const frame = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const canvas = renderMap(result)
+    canvas.setAttribute('role', 'img')
+    canvas.setAttribute('aria-label', '等时圈示意图')
+    frame.current?.replaceChildren(canvas)
+  }, [result])
+  return <div className="offline-map">
+    <div ref={frame} />
+  </div>
 }
 
 export default function MapView(props: Props) {
@@ -66,6 +102,9 @@ export default function MapView(props: Props) {
   }, [props.center.lng, props.center.lat, props.radius])
 
   const { result, bands, lines, samples, liveSamples } = props
+  const offline = !showAmap && result && !result.preview
+  const showLegend = nativeReady && result &&
+    (result.bands.features.length > 0 || result.observed_from || result.finished_at)
   useEffect(() => {
     if (nativeReady) adapter.current?.setResult(result, { bands, lines, samples }, liveSamples)
   }, [nativeReady, result, bands, lines, samples, liveSamples])
@@ -75,14 +114,18 @@ export default function MapView(props: Props) {
       {showAmap && <div className="amap" ref={mapElement} onPointerDownCapture={event => {
         if (event.button === 0) props.onMapInteract()
       }} />}
-      {errorMessage && <div className="map-setup" role="status">
+      {offline && <OfflineMap result={result} />}
+      {!offline && errorMessage && <div className="map-setup" role="status">
         <strong>高德底图加载失败</strong>
         <button type="button" className="text-button" onClick={props.onConfigure}>检查高德设置</button>
       </div>}
-      {!errorMessage && props.setupPrompt}
+      {!offline && !errorMessage && props.setupPrompt}
       <div className="map-bottom">
-        {nativeReady && result && <TravelLegend result={result} />}
-        {props.jobControl}
+        <div className="map-feedback">
+          <AnimatedPanel>{props.notice}</AnimatedPanel>
+          <AnimatedPanel>{props.jobControl}</AnimatedPanel>
+          <AnimatedPanel wide>{showLegend && <TravelLegend result={result} />}</AnimatedPanel>
+        </div>
         {nativeReady && <div className="map-tools" aria-label="地图工具">
           <div className="map-controls">
             <div className="compass" aria-label="北方"><b>N</b><span>▲</span></div>
@@ -95,6 +138,10 @@ export default function MapView(props: Props) {
           </div>
         </div>}
       </div>
+      {nativeReady && result?.mode === 'metro' && <a className="map-attribution"
+        href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">
+        © OpenStreetMap 贡献者（ODbL）
+      </a>}
     </section>
   )
 }
@@ -106,12 +153,11 @@ const beijingTime = new Intl.DateTimeFormat('zh-CN', {
 function TravelLegend({ result }: { result: Result }) {
   const features = result.bands.features
   const count = features.length
-  const from = result.observed_from ? beijingTime.format(new Date(result.observed_from)) : null
-  const to = result.observed_to ? beijingTime.format(new Date(result.observed_to)) : null
+  const started = result.observed_from ?? result.finished_at
+  const from = started ? beijingTime.format(new Date(started)) : null
+  const to = result.observed_from && result.observed_to ? beijingTime.format(new Date(result.observed_to)) : null
   return <aside className="legend" aria-label="等时圈图例">
-    {result.preview && <p className="legend-time">初步等时圈 · 正在加密</p>}
     {from && <p className="legend-time">算路时间 {from}{to && from !== to ? `–${to}` : ''}（北京时间）</p>}
-    {!result.preview && result.boundary_truncated && <p className="legend-time">外缘未确认 · 结果可能向外延伸</p>}
     {count > 0 && <div className="legend-scale" style={{ gridTemplateColumns: `repeat(${count}, minmax(0, 1fr))` }}>
       {features.map(({ properties }, index) => <div className="legend-segment" key={properties.maximum_min}>
         <span style={{ backgroundColor: bandColor(index, count) }}

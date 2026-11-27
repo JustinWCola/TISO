@@ -120,10 +120,10 @@ export default function AmapSettings({ settings, onSave, busy }: {
         {settings.routing_configured && !settings.web_service_saved && <p className="hint">当前使用环境变量中的 Web 服务 Key。</p>}
       </fieldset>
       <a className="settings-link" href="https://lbs.amap.com/api/javascript-api-v2/guide/abc/jscode" target="_blank" rel="noreferrer">高德 Key 与安全密钥说明 ↗</a>
-      <div className="actions settings-actions">
-        <button type="submit" className="primary" disabled={busy || saving}>{saving ? '正在保存…' : '保存设置'}</button>
+      <div className="action-pair settings-actions">
+        <button type="submit" className="primary" disabled={busy || saving}><Icon name="check" />{saving ? '正在保存…' : '保存设置'}</button>
         <button className="secondary" type="button" disabled={busy || saving || (!settings.js_key && !settings.web_service_saved)}
-          onClick={() => void save(true)}>清除本地配置</button>
+          onClick={() => void save(true)}><Icon name="trash" />清除本地配置</button>
       </div>
       {(feedback.text || busy) && <p role="status" className={`hint${feedback.error ? ' error' : ''}`}>
         {busy ? '请等待当前分析结束后再保存。' : feedback.text}

@@ -349,7 +349,7 @@ function zoomForRadius(radius: number) {
   return Math.max(8, Math.min(15, Math.round(11 + Math.log2(15000 / radius))))
 }
 
-export async function searchAmap(config: AmapConfig, query: string): Promise<{ name: string; point: Destination }[]> {
+export async function searchAmap(config: AmapConfig, query: string): Promise<{ name: string; address?: string; point: Destination }[]> {
   const api = await load(config)
   return new Promise((resolve, reject) => {
     const timeout = window.setTimeout(() => reject(new Error('高德地点搜索超时。')), 10000)
@@ -359,7 +359,8 @@ export async function searchAmap(config: AmapConfig, query: string): Promise<{ n
       if (status === 'no_data') resolve([])
       else if (status !== 'complete') reject(new Error('高德地点搜索失败。'))
       else resolve((result?.poiList?.pois ?? []).flatMap(place => place.location ? [{
-        name: [place.name, place.address].filter(Boolean).join(' · '),
+        name: place.name,
+        address: place.address,
         point: { lng: place.location.getLng(), lat: place.location.getLat() },
       }] : []))
     })
