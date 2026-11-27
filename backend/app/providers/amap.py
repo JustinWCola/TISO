@@ -7,6 +7,7 @@ from email.utils import parsedate_to_datetime
 import httpx
 
 from .amap_response import ENDPOINT, parse_results
+from .amap_metro import METRO_ENDPOINT, parse_metro, route_parameters
 from .base import DRIVING_CAPABILITIES, Capabilities, Point, TravelResult, validate_driving_request
 
 # HTTPX logs request URLs at INFO, and the upstream requires the Key in the query.
@@ -34,6 +35,21 @@ class AmapProvider:
             "destination": f"{destination.lon:.6f},{destination.lat:.6f}",
             "type": "1",
         }
+        rows = parse_results(await self._get(ENDPOINT, params, before_request), origins)
+        observed_at = datetime.now(UTC)
+        return [TravelResult(
+            row["point_id"], row.get("duration_s"), row.get("distance_m"),
+            row["status"], row.get("provider_error"), observed_at,
+        ) for row in rows]
+
+    async def metro_departure(
+        self, origin: Point, destination: Point, citycode: str, departure: datetime, *,
+        before_request: Callable[[], None] | None = None,
+    ) -> TravelResult:
+        params = {"key": self.key, **route_parameters(origin, destination, citycode, departure)}
+        return parse_metro(await self._get(METRO_ENDPOINT, params, before_request), origin)
+
+    async def _get(self, endpoint: str, params: dict, before_request: Callable[[], None] | None) -> object:
         clock = asyncio.get_running_loop()
         for attempt in range(3):
             await asyncio.sleep(max(0, self.next_request_at - clock.time()))
@@ -42,7 +58,7 @@ class AmapProvider:
             self.next_request_at = clock.time() + 1
             try:
                 async with asyncio.timeout(15):
-                    response = await self.client.get(ENDPOINT, params=params)
+                    response = await self.client.get(endpoint, params=params)
             except (httpx.RequestError, TimeoutError):
                 if attempt == 2 or before_request is None:
                     raise ValueError("高德请求超时或连接失败") from None
@@ -58,15 +74,9 @@ class AmapProvider:
                 self.next_request_at = max(self.next_request_at, clock.time() + delay)
             await asyncio.sleep(1.0 * 2 ** attempt)
         try:
-            payload = response.json()
+            return response.json()
         except (ValueError, RecursionError):
             raise ValueError("高德返回了无效 JSON") from None
-        rows = parse_results(payload, origins)
-        observed_at = datetime.now(UTC)
-        return [TravelResult(
-            row["point_id"], row.get("duration_s"), row.get("distance_m"),
-            row["status"], row.get("provider_error"), observed_at,
-        ) for row in rows]
 
 
 def retry_delay(header: str | None) -> float:

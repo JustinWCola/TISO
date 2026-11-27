@@ -14,12 +14,17 @@ def numeric_field(value: object) -> float:
     return number
 
 
-def parse_results(payload: object, origins: list[Point]) -> list[dict]:
+def check_success(payload: object) -> dict:
     if not isinstance(payload, dict) or str(payload.get("status")) != "1":
         code = str(payload.get("infocode", "")) if isinstance(payload, dict) else ""
         if code.isascii() and code.isdecimal() and len(code) == 5:
             raise ValueError(f"Amap business error (infocode {code})")
         raise ValueError("Amap response lacked a valid success status")
+    return payload
+
+
+def parse_results(payload: object, origins: list[Point]) -> list[dict]:
+    payload = check_success(payload)
     if not isinstance(payload.get("results"), list):
         raise ValueError("Amap response lacked a results array")
     by_index = {}
