@@ -49,11 +49,15 @@ try {
   await page.keyboard.press('Escape')
   await page.getByLabel('Web 端 JS Key', { exact: true }).waitFor({ state: 'hidden' })
   const analysis = page.locator('#analysis-toggle')
+  const logo = analysis.locator('.brand-icon img')
+  await logo.waitFor()
+  await logo.evaluate(image => image.decode())
   assert.equal(await analysis.getAttribute('aria-expanded'), 'false')
   assert.equal(await generate.isVisible(), false)
   const collapsed = await analysis.boundingBox()
   const radiusBefore = await analysis.evaluate(button => getComputedStyle(button.parentElement).borderRadius)
   await analysis.click()
+  assert.ok(await logo.isVisible())
   const expanded = await analysis.boundingBox()
   assert.equal(expanded.x, collapsed.x)
   assert.equal(expanded.y, collapsed.y)
@@ -354,7 +358,9 @@ try {
   assert.equal(await legend.getByRole('button', { name: /导出/ }).count(), 0)
   const basemap = configured.locator('.amap [data-basemap]')
   const compass = await configured.locator('.compass').boundingBox()
-  const layerButton = await configured.locator('#layers-toggle').boundingBox()
+  const layersToggle = configured.getByRole('button', { name: '图层', exact: true })
+  const layerButton = await layersToggle.boundingBox()
+  assert.equal(await layersToggle.textContent(), '')
   const zoomGroup = await configured.locator('.zoom-controls').boundingBox()
   assert.deepEqual([compass.width, compass.height], [layerButton.width, layerButton.height])
   assert.equal(zoomGroup.width, layerButton.width)
@@ -634,7 +640,7 @@ try {
     const heading = document.querySelector(selector)
     const title = getComputedStyle(heading.querySelector('.menu-title'))
     const icon = getComputedStyle(heading.querySelector('.brand-icon'))
-    const glyph = getComputedStyle(heading.querySelector('.brand-icon svg'))
+    const glyph = getComputedStyle(heading.querySelector('.brand-icon :is(svg, img)'))
     return [title.fontSize, title.fontWeight, title.lineHeight, icon.width, icon.height, glyph.width, glyph.height]
   }))
   assert.deepEqual(menuStyles[1], menuStyles[0])
@@ -734,10 +740,15 @@ try {
   await configured.waitForFunction(() => {
     const bounds = selector => document.querySelector(selector).getBoundingClientRect()
     const label = bounds('.map-point-label')
+    const icon = bounds('.map-point-label svg')
+    const name = bounds('.map-point-label span')
+    const centerY = box => (box.top + box.bottom) / 2
     const first = bounds('.analysis-dock')
     const last = bounds('.settings-dock')
     return label.top === first.top && label.top === last.top && label.height === first.height
       && label.height === last.height && first.right < label.left && label.right < last.left
+      && Math.abs(centerY(label) - centerY(icon)) < 1
+      && Math.abs(centerY(name) - centerY(icon) - 1) < 0.1
   })
   await configured.locator('#analysis-toggle').click()
   const enableSchedule = configured.getByRole('button', { name: '开启定时' })

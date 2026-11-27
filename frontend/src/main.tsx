@@ -10,6 +10,7 @@ import MapView from './MapView'
 import QueryPanel from './QueryPanel'
 import { destinationFromInputs, jobs, request, schedules, terminal } from './api'
 import type { Destination, Estimate, Job, MetroNetwork, Parameters, Result, Sample, SavedResult, Schedule } from './api'
+import tisoIcon from './tiso-icon.svg'
 import './style.css'
 
 const shanghai = { lng: 121.4737, lat: 31.2304 }
@@ -445,8 +446,9 @@ function App() {
   </div>
   const layerControl = <div className="layer-dock">
     <button type="button" id="layers-toggle" className="floating-button"
+      aria-label="图层"
       aria-expanded={layersOpen} aria-controls="map-layers"
-      onClick={() => setLayersOpen(value => !value)}><Icon name="layers" />图层</button>
+      onClick={() => setLayersOpen(value => !value)}><Icon name="layers" /></button>
     {layersOpen && <div className="layers floating-panel" id="map-layers" aria-label="结果图层">
       <label><input type="checkbox" checked={bands} onChange={e => setBands(e.target.checked)} />等时面</label>
       <label><input type="checkbox" checked={lines} onChange={e => setLines(e.target.checked)} />等时线</label>
@@ -476,7 +478,7 @@ function App() {
         <button type="button" id="analysis-toggle" className="dock-toggle" aria-expanded={analysisOpen}
           aria-label="TISO · 交通可达性" title={analysisOpen ? undefined : 'TISO · 交通可达性'}
           aria-controls="analysis-controls" onClick={() => togglePanel('analysis')}>
-          <span className="brand-icon"><Icon name="pin" /></span>
+          <span className="brand-icon"><img src={tisoIcon} alt="" /></span>
           <span className="brand-name"><strong className="menu-title">TISO</strong><span>交通可达性</span></span>
           {analysisOpen && <span className="dock-collapse">收起</span>}
           <Icon name="chevron" />
