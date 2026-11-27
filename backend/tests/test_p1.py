@@ -117,7 +117,7 @@ def test_local_amap_settings_persist_and_proxy_keeps_credentials_private(monkeyp
         assert json.loads(saved.read_bytes()) == keys
 
         async def upstream(request_url, *, params, headers, timeout):
-            assert request_url == "https://restapi.amap.com/v3/place/text"
+            assert request_url in {"https://restapi.amap.com/v3/place/text", "https://restapi.amap.com/v3/geocode/regeo"}
             assert dict(params)["jscode"] == keys["js_security_code"]
             assert keys["web_service_key"] not in str(params)
             callback = dict(params).get("callback")
@@ -143,9 +143,33 @@ def test_local_amap_settings_persist_and_proxy_keeps_credentials_private(monkeyp
         assert json.loads(response.text.removeprefix("amapSearchCallback(").removesuffix(");"))["pois"] == [
             {"name": "人民广场"},
         ]
+        response = client.get("/_AMapService/v3/geocode/regeo",
+                              params={"callback": "amapGeocoderCallback", "key": keys["js_key"]}, headers=jsonp_headers)
+        assert response.headers["content-type"] == "application/javascript; charset=utf-8"
         response = client.get(proxy, params={"callback": "amapSearchCallback);alert(1)", "key": keys["js_key"]},
                               headers=jsonp_headers)
         assert response.headers["content-type"].startswith("application/json")
+
+        async def reverse_upstream(request_url, *, params, timeout):
+            assert request_url == "https://restapi.amap.com/v3/geocode/regeo"
+            assert params["key"] == keys["web_service_key"]
+            pois = [
+                {"name": "远处地点", "distance": "120"},
+                {"name": "附近地点", "distance": "50"},
+                {"name": "人民广场", "distance": "0"},
+            ] if params["location"] == "121.473700,31.230400" else []
+            return httpx.Response(200, request=httpx.Request("GET", request_url), json={
+                "status": "1", "regeocode": {"formatted_address": "上海市黄浦区", "pois": pois},
+            })
+
+        monkeypatch.setattr(app.state.amap_client, "get", reverse_upstream)
+        reverse = "/api/v1/places/reverse"
+        point = {"lng": 121.4737, "lat": 31.2304}
+        assert client.post(reverse, json=point).status_code == 403
+        assert client.post(reverse, json=point, headers={"Origin": origin}).json() == {"name": "人民广场"}
+        assert client.post(reverse, json={**point, "lng": 121.49}, headers={"Origin": origin}).json() == {
+            "name": "上海市黄浦区",
+        }
 
         response = client.post(url, json={key: "" for key in keys}, headers={"Origin": origin})
         assert response.json() == {"js_key": "", "routing_configured": False, "web_service_saved": False}

@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, SecretStr, field_validator
 
 from .providers.amap import AmapProvider
+from .schemas import Destination
 
 router = APIRouter()
 
@@ -161,8 +162,8 @@ async def proxy_amap(path: str, request: Request):
         raise HTTPException(502, "高德服务返回了异常响应")
     content = upstream.content.replace(security_code.encode(), b"[redacted]")
     callbacks = request.query_params.getlist("callback")
-    # AMap PlaceSearch sends a script request, but its JSONP response is labeled application/json.
-    if (path == "v3/place/text" and media_type == "application/json" and len(callbacks) == 1
+    # AMap location plugins can send script requests whose JSONP responses are labeled application/json.
+    if (path in {"v3/place/text", "v3/geocode/regeo"} and media_type == "application/json" and len(callbacks) == 1
             and request.headers.get("sec-fetch-dest") == "script"):
         callback = callbacks[0].encode()
         body = content.strip().removesuffix(b";").rstrip()
@@ -177,3 +178,44 @@ async def proxy_amap(path: str, request: Request):
     return Response(content, status_code=upstream.status_code, headers={
         "Content-Type": content_type, "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
     })
+
+
+@router.post("/api/v1/places/reverse")
+async def reverse_place(point: Destination, request: Request):
+    if (request.headers.get("origin") != local_origin(request)
+            or request.headers.get("sec-fetch-site", "same-origin") != "same-origin"):
+        raise HTTPException(403, "请从本机 TISO 页面识别地点")
+    state = request.app.state
+    key = routing_key(state.amap_settings)
+    if not key:
+        raise HTTPException(503, "请先配置高德 Web 服务 Key")
+    radius = 100
+    try:
+        response = await state.amap_client.get(
+            "https://restapi.amap.com/v3/geocode/regeo",
+            params={"key": key, "location": f"{point.lng:.6f},{point.lat:.6f}",
+                    "radius": radius, "extensions": "all"},
+            timeout=3,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except (httpx.HTTPError, ValueError, RecursionError):
+        raise HTTPException(502, "高德地点识别暂时不可用") from None
+    if not isinstance(data, dict) or data.get("status") != "1" or not isinstance(data.get("regeocode"), dict):
+        raise HTTPException(502, "高德地点识别暂时不可用")
+    result = data["regeocode"]
+    address = result.get("formatted_address")
+    name = address.strip() if isinstance(address, str) else ""
+    nearest = radius + 1
+    pois = result.get("pois")
+    for poi in pois if isinstance(pois, list) else []:
+        if not isinstance(poi, dict) or not isinstance(poi.get("name"), str) or not poi["name"].strip():
+            continue
+        try:
+            distance = float(poi.get("distance"))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= distance <= radius and distance < nearest:
+            name = poi["name"].strip()
+            nearest = distance
+    return {"name": name[:256]}

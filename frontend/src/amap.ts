@@ -21,12 +21,16 @@ type Marker = {
   setMap(map: MapInstance | null): void
 }
 type Place = { name: string; address?: string; location?: LngLat }
+type ReverseGeocode = { formattedAddress?: string; pois?: { name: string; distance?: number | string }[] }
 type sdk = {
   Map: new (element: HTMLElement, options: object) => MapInstance
   Marker: new (options: object) => Marker
   CustomLayer?: new (canvas: HTMLCanvasElement, options: object) => MapLayer
   PlaceSearch: new (options: object) => {
     search(query: string, callback: (status: string, result: { poiList?: { pois: Place[] } }) => void): void
+  }
+  Geocoder: new (options: { radius: number; extensions: 'all' }) => {
+    getAddress(point: Coordinates, callback: (status: string, result: { regeocode?: ReverseGeocode }) => void): void
   }
 }
 
@@ -76,7 +80,7 @@ function load(config: AmapConfig): Promise<sdk> {
       reject(new Error('高德底图加载失败'))
     }
     script.src = 'https://webapi.amap.com/maps?' + new URLSearchParams({
-      v: '2.0', key: config.key, plugin: 'AMap.PlaceSearch',
+      v: '2.0', key: config.key, plugin: 'AMap.PlaceSearch,AMap.Geocoder',
     })
     script.onload = () => {
       window.clearTimeout(timeout)
@@ -358,6 +362,29 @@ export async function searchAmap(config: AmapConfig, query: string): Promise<{ n
         name: [place.name, place.address].filter(Boolean).join(' · '),
         point: { lng: place.location.getLng(), lat: place.location.getLat() },
       }] : []))
+    })
+  })
+}
+
+export async function identifyAmapPoint(config: AmapConfig, point: Destination): Promise<string> {
+  const api = await load(config)
+  const radius = 100
+  const geocoder = new api.Geocoder({ radius, extensions: 'all' })
+  return new Promise(resolve => {
+    const timeout = window.setTimeout(() => resolve(''), 3000)
+    geocoder.getAddress([point.lng, point.lat], (status, result) => {
+      window.clearTimeout(timeout)
+      const address = status === 'complete' ? result?.regeocode : undefined
+      let nearest = ''
+      let nearestDistance = Infinity
+      for (const poi of address?.pois ?? []) {
+        const distance = parseFloat(String(poi.distance))
+        if (poi.name?.trim() && distance >= 0 && distance <= radius && distance < nearestDistance) {
+          nearest = poi.name.trim()
+          nearestDistance = distance
+        }
+      }
+      resolve(nearest || address?.formattedAddress?.trim() || '')
     })
   })
 }
