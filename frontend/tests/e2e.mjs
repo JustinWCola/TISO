@@ -111,6 +111,7 @@ try {
   await configured.route('**/api/v1/settings/amap', route => route.fulfill({
     json: { js_key: 'browser-test-fixture', routing_configured: true, web_service_saved: true },
   }))
+  await configured.route('**/api/v1/isochrones/schedules', route => route.fulfill({ json: [] }))
   await configured.route('**/api/v1/places/reverse', async route => {
     const { lng } = route.request().postDataJSON()
     if (lng !== 121.4737) await new Promise(resolve => setTimeout(resolve, 150))
@@ -613,6 +614,20 @@ try {
   await management.getByRole('button', { name: '查看', exact: true }).waitFor()
   await management.getByText('人民广场', { exact: true }).waitFor()
   await management.getByText('驾车', { exact: true }).waitFor()
+  const ordinaryCard = management.getByRole('listitem').first()
+  const ordinaryColors = await ordinaryCard.locator('.query-mode, .query-actions button').evaluateAll(chips => chips.map(chip => {
+    const { backgroundColor, color } = getComputedStyle(chip)
+    return [backgroundColor, color]
+  }))
+  assert.deepEqual(ordinaryColors, Array.from({ length: 3 }, () => ['rgb(238, 240, 243)', 'rgb(23, 25, 29)']))
+  assert.ok(await ordinaryCard.locator('.query-actions button').evaluateAll(buttons => buttons.every(button => {
+    const range = document.createRange()
+    range.selectNodeContents(button)
+    const text = range.getBoundingClientRect()
+    const control = button.getBoundingClientRect()
+    return Math.abs((text.left + text.right) - (control.left + control.right)) <= 2
+      && Math.abs((text.top + text.bottom) - (control.top + control.bottom)) <= 2
+  })))
   const historyHeight = (await management.boundingBox()).height
   assert.equal(historyHeight, 560)
   const menuStyles = await configured.evaluate(() => ['#analysis-toggle', '#amap-toggle', '.query-heading'].map(selector => {
@@ -695,7 +710,19 @@ try {
   })
   await management.getByRole('button', { name: '关闭历史结果' }).click()
   await configured.getByLabel('地点关键词').fill('人民广场')
-  await configured.getByRole('button', { name: '搜索', exact: true }).click()
+  const search = configured.getByRole('button', { name: '搜索', exact: true })
+  const transport = configured.getByRole('radiogroup', { name: '交通方式' })
+  assert.ok((await search.boundingBox()).y < (await transport.boundingBox()).y)
+  assert.ok(await search.evaluate(button => {
+    const style = getComputedStyle(button)
+    const field = button.closest('.search')
+    const radius = button.getBoundingClientRect().height / 2
+    return parseFloat(style.borderTopRightRadius) >= radius
+      && style.backgroundColor === getComputedStyle(document.querySelector('.generate')).backgroundColor
+      && field.getBoundingClientRect().right - button.getBoundingClientRect().right
+        === parseFloat(getComputedStyle(field).borderTopRightRadius) - radius
+  }))
+  await search.click()
   await configured.getByRole('button', { name: '人民广场 · 上海市黄浦区' }).click()
   await pick([121.49, 31.24])
   await configured.waitForFunction(() => document.querySelector('.search input').value === '上海市黄浦区中山东一路')
@@ -753,8 +780,21 @@ try {
   await configured.locator('#analysis-toggle').click()
   assert.ok(await scheduleTime.isHidden())
   assert.ok(await enableSchedule.isVisible())
+  historyDeleted = false
   await configured.getByRole('button', { name: '历史结果', exact: true }).click()
-  await management.getByRole('heading', { name: '已设置的日程' }).waitFor()
+  const cards = management.getByRole('listitem')
+  await cards.first().getByText(/每天 09:15/).waitFor()
+  await cards.nth(1).getByRole('button', { name: '查看', exact: true }).waitFor()
+  assert.equal(await management.getByRole('heading', { name: '已设置的日程' }).count(), 0)
+  assert.ok(await cards.first().evaluate(card => {
+    const style = getComputedStyle(card)
+    return style.color === 'rgb(255, 255, 255)' && style.backgroundColor === 'rgb(23, 25, 29)'
+  }))
+  const chipColors = await cards.first().locator('.query-mode, .query-actions button').evaluateAll(chips => chips.map(chip => {
+    const { backgroundColor, color } = getComputedStyle(chip)
+    return [backgroundColor, color]
+  }))
+  assert.deepEqual(chipColors, Array.from({ length: 3 }, () => ['rgb(53, 57, 65)', 'rgb(255, 255, 255)']))
   await management.getByRole('button', { name: '暂停', exact: true }).click()
   await management.getByRole('button', { name: '恢复', exact: true }).waitFor()
   console.log('Browser E2E passed: map rendering, metro, history and schedules.')

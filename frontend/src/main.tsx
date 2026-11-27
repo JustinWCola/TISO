@@ -485,6 +485,18 @@ function App() {
           <div className="dock-content">
             <div className="analysis-card">
               <h1 id="analysis-title" className="visually-hidden">等时圈分析</h1>
+              {amapConfig && !reloadMap && (
+                <form className="search" onSubmit={event => { event.preventDefault(); void findPlace() }}>
+                  <Icon name="search" />
+                  <input aria-label="地点关键词" placeholder="搜索目的地" value={query} onChange={event => setQuery(event.target.value)} />
+                  <button type="submit" className="primary" disabled={searching || !query.trim()}>{searching ? '搜索中…' : '搜索'}</button>
+                  {!!places.length && <ul className="search-results">{places.map(({ name, address, point }, index) =>
+                    <li key={index}><button type="button" onClick={() => choose(point, name)}>
+                      {name}{address && ` · ${address}`}
+                    </button></li>)}</ul>}
+                </form>
+              )}
+
               <div className="mode-switch" role="radiogroup" aria-label="交通方式" data-mode={mode}>
                 <label>
                   <input type="radio" name="travel-mode" value="driving" checked={!metro}
@@ -497,18 +509,6 @@ function App() {
                   <span><Icon name="transit" />地铁</span>
                 </label>
               </div>
-
-              {amapConfig && !reloadMap && (
-                <form className="search" onSubmit={event => { event.preventDefault(); void findPlace() }}>
-                  <Icon name="search" />
-                  <input aria-label="地点关键词" placeholder="搜索目的地" value={query} onChange={event => setQuery(event.target.value)} />
-                  <button type="submit" className="text-button" disabled={searching || !query.trim()}>{searching ? '搜索中…' : '搜索'}</button>
-                  {!!places.length && <ul className="search-results">{places.map(({ name, address, point }, index) =>
-                    <li key={index}><button type="button" onClick={() => choose(point, name)}>
-                      {name}{address && ` · ${address}`}
-                    </button></li>)}</ul>}
-                </form>
-              )}
 
               <div className="analysis-sliders">
                 <AnalysisSlider label="最长耗时" value={duration} min={15} max={120} step={5}

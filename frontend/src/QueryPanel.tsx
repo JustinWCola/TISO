@@ -95,41 +95,8 @@ export default function QueryPanel({ busy, onClose, onView, onDelete }: {
     <div className="query-content">
       {error && <p className="hint error" role="alert">{error}</p>}
       <section aria-labelledby="query-title" className="query-section">
-        {past === null && !error && <p className="hint" role="status">正在读取历史结果…</p>}
-        {past?.items.length === 0 && <p className="hint">暂无历史结果</p>}
-        {!!past?.items.length && <ul className="query-list">
-          {past.items.map(item => <li key={item.id}>
-            <div className="query-record-content">
-              <RecordHeading params={item.params} />
-              <p>{dateFormat.format(new Date(item.finished_at))} · {item.params.max_duration_min} 分钟
-                {item.status === 'partial' && ' · 部分结果'}
-                {item.schedule_id && ' · 定时查询'}</p>
-            </div>
-            <div className="query-actions">
-              <button type="button" className="secondary" disabled={busy || pending}
-                onClick={() => void perform(async () => onView(await request<SavedResult>(history + '/' + item.id)))}>查看</button>
-              <button type="button" className="secondary" disabled={pending} onClick={() => {
-                if (!window.confirm('删除这条历史结果？')) return
-                void perform(async () => {
-                  await request(history + '/' + item.id, undefined, undefined, 'DELETE')
-                  onDelete(item.id)
-                  if (past.items.length === 1 && offset > 0) setOffset(value => value - pageSize)
-                })
-              }}>删除</button>
-            </div>
-          </li>)}
-        </ul>}
-        {(offset > 0 || past?.more) && <div className="query-actions query-pagination">
-          <button type="button" className="secondary" disabled={offset === 0 || pending}
-            onClick={() => { setPast(null); setOffset(value => value - pageSize) }}>上一页</button>
-          <button type="button" className="secondary" disabled={!past?.more || pending}
-            onClick={() => { setPast(null); setOffset(value => value + pageSize) }}>下一页</button>
-        </div>}
-      </section>
-      {plans && plans.length > 0 && <section aria-labelledby="plans-title" className="query-section">
-        <h3 id="plans-title">已设置的日程</h3>
-        <ul className="query-list">
-          {plans.map(plan => <li key={plan.id}>
+        {!!(plans?.length || past?.items.length) && <ul className="query-list">
+          {plans?.map(plan => <li className="query-scheduled" key={`schedule-${plan.id}`}>
             <div className="query-record-content">
               <RecordHeading params={plan.params} />
               <p>每天 {plan.clock} · {plan.params.max_duration_min} 分钟</p>
@@ -148,8 +115,36 @@ export default function QueryPanel({ busy, onClose, onView, onDelete }: {
               }}>删除</button>
             </div>
           </li>)}
-        </ul>
-      </section>}
+          {past?.items.map(item => <li key={item.id}>
+            <div className="query-record-content">
+              <RecordHeading params={item.params} />
+              <p>{dateFormat.format(new Date(item.finished_at))} · {item.params.max_duration_min} 分钟
+                {item.status === 'partial' && ' · 部分结果'}
+                {item.schedule_id && ' · 定时查询'}</p>
+            </div>
+            <div className="query-actions">
+              <button type="button" className="secondary" disabled={busy || pending}
+                onClick={() => void perform(async () => onView(await request<SavedResult>(history + '/' + item.id)))}>查看</button>
+              <button type="button" className="secondary" disabled={pending} onClick={() => {
+                if (!window.confirm('删除这条历史结果？')) return
+                void perform(async () => {
+                  await request(history + '/' + item.id, undefined, undefined, 'DELETE')
+                  onDelete(item.id)
+                  if (past?.items.length === 1 && offset > 0) setOffset(value => value - pageSize)
+                })
+              }}>删除</button>
+            </div>
+          </li>)}
+        </ul>}
+        {past === null && !error && <p className="hint" role="status">正在读取历史结果…</p>}
+        {past?.items.length === 0 && <p className="hint">暂无历史结果</p>}
+        {(offset > 0 || past?.more) && <div className="query-actions query-pagination">
+          <button type="button" className="secondary" disabled={offset === 0 || pending}
+            onClick={() => { setPast(null); setOffset(value => value - pageSize) }}>上一页</button>
+          <button type="button" className="secondary" disabled={!past?.more || pending}
+            onClick={() => { setPast(null); setOffset(value => value + pageSize) }}>下一页</button>
+        </div>}
+      </section>
     </div>
   </dialog>
 }
