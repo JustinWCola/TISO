@@ -20,6 +20,7 @@ export type FeatureCollection<T> = {
 }
 export type Sample = { coordinates: Coordinates; duration_s: number | null; status: string }
 export type Result = {
+  mode?: 'driving' | 'metro'
   job_id: string; destination: Destination; radius_m: number; spacing_m: number
   preview: boolean; boundary_truncated: boolean
   contours: FeatureCollection<Coordinates[][]>; bands: FeatureCollection<Coordinates[][][]>

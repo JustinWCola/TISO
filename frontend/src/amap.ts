@@ -118,6 +118,8 @@ export async function createAmap(
   let result: Result | null = null
   let liveSamples: Sample[] | undefined
   let visible: TravelLayers = { bands: true, lines: true, samples: false }
+  let metro: ReturnType<typeof prepareMetroLayers> | null = null
+  let lastMetroFrame: number[] | null = null
 
   function project(point: Coordinates): Coordinates {
     const pixel = map.lngLatToContainer(point)
@@ -132,6 +134,14 @@ export async function createAmap(
     const ratio = window.devicePixelRatio || 1
     const pixelWidth = Math.round(width * ratio)
     const pixelHeight = Math.round(height * ratio)
+    const transform = metro?.transform(project)
+    if (transform) {
+      const currentFrame = [width, height, ratio, ...transform]
+      if (currentFrame.every((value, index) => value === lastMetroFrame?.[index])) return
+      lastMetroFrame = currentFrame
+    } else {
+      lastMetroFrame = null
+    }
     if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
       canvas.width = pixelWidth
       canvas.height = pixelHeight
@@ -140,7 +150,12 @@ export async function createAmap(
     }
     context.setTransform(ratio, 0, 0, ratio, 0, 0)
     context.clearRect(0, 0, width, height)
-    paintTravelLayers(context, project, result, visible, liveSamples)
+    if (metro && transform) {
+      metro.paint(context, visible, transform)
+      if (visible.samples) paintSamples(context, project, liveSamples ?? result?.samples ?? [])
+    } else {
+      paintTravelLayers(context, project, result, visible, liveSamples)
+    }
   }
 
   const moveEvents = ['mapmove', 'zoomchange', 'moveend', 'zoomend', 'resize', 'complete']
@@ -193,9 +208,13 @@ export async function createAmap(
       paint()
     },
     setResult(next: Result | null, layers: TravelLayers, points?: Sample[]) {
+      if (next !== result) {
+        metro = next?.mode === 'metro' && typeof Path2D !== 'undefined' ? prepareMetroLayers(next) : null
+      }
       result = next
       visible = layers
       liveSamples = points
+      lastMetroFrame = null
       paint()
     },
     destroy() {
@@ -213,30 +232,97 @@ export async function createAmap(
 }
 
 type TravelLayers = { bands: boolean; lines: boolean; samples: boolean }
+type Project = (point: Coordinates) => Coordinates
+type MapTransform = [number, number, number, number, number, number]
 
-function paintTravelLayers(
+function trace(target: Pick<Path2D, 'moveTo' | 'lineTo' | 'closePath'>,
+  path: Coordinates[], project: Project, close: boolean) {
+  path.forEach((point, index) => {
+    const [x, y] = project(point)
+    if (index === 0) target.moveTo(x, y)
+    else target.lineTo(x, y)
+  })
+  if (close) target.closePath()
+}
+
+function mercatorY(latitude: number) {
+  return -Math.asinh(Math.tan(latitude * Math.PI / 180)) * 180 / Math.PI
+}
+
+function prepareMetroLayers(result: Result) {
+  const { lng, lat } = result.destination
+  const originY = mercatorY(lat)
+  const northDelta = mercatorY(lat + 1) - originY
+  const world: Project = ([x, y]) => [x - lng, mercatorY(y) - originY]
+  const bands = result.bands.features.map((feature, index, features) => {
+    const path = new Path2D()
+    for (const polygon of feature.geometry.coordinates) {
+      for (const ring of polygon) trace(path, ring, world, true)
+    }
+    return { path, color: bandColor(index, features.length) }
+  })
+  const outline = new Path2D()
+  for (const feature of result.contours.features) {
+    for (const line of feature.geometry.coordinates) trace(outline, line, world, false)
+  }
+
+  return {
+    transform(project: Project): MapTransform | undefined {
+      // The 2D map projects Web Mercator onto the canvas with a single affine transform.
+      const [x, y] = project([lng, lat])
+      const [eastX, eastY] = project([lng + 1, lat])
+      const [northX, northY] = project([lng, lat + 1])
+      const a = eastX - x, b = eastY - y
+      const c = (northX - x) / northDelta, d = (northY - y) / northDelta
+      const matrix: MapTransform = [a, b, c, d, x, y]
+      if (matrix.every(Number.isFinite) && Math.abs(a * d - b * c) > 1e-8) return matrix
+    },
+    paint(context: CanvasRenderingContext2D, visible: TravelLayers, matrix: MapTransform) {
+      context.save()
+      context.transform(...matrix)
+      if (visible.bands) {
+        context.globalAlpha = 0.68
+        for (const { path, color } of bands) {
+          context.fillStyle = color
+          context.fill(path, 'evenodd')
+        }
+        context.globalAlpha = 1
+      }
+      if (visible.lines) {
+        context.strokeStyle = '#324b51'
+        context.lineWidth = 1.4 / Math.hypot(matrix[0], matrix[1])
+        context.stroke(outline)
+      }
+      context.restore()
+    },
+  }
+}
+
+function paintSamples(context: CanvasRenderingContext2D, project: Project, samples: Sample[]) {
+  for (const sample of samples) {
+    if (sample.status === 'outside_scope') continue
+    const [x, y] = project(sample.coordinates)
+    context.beginPath()
+    context.arc(x, y, 2.2, 0, 2 * Math.PI)
+    context.fillStyle = sampleColor(sample.status)
+    context.fill()
+  }
+}
+
+export function paintTravelLayers(
   context: CanvasRenderingContext2D,
-  project: (point: Coordinates) => Coordinates,
+  project: Project,
   result: Result | null,
   visible: TravelLayers,
   liveSamples?: Sample[],
 ) {
-  function trace(path: Coordinates[], close: boolean) {
-    path.forEach((point, index) => {
-      const [x, y] = project(point)
-      if (index === 0) context.moveTo(x, y)
-      else context.lineTo(x, y)
-    })
-    if (close) context.closePath()
-  }
-
   if (result && visible.bands) {
     context.globalAlpha = 0.68
     result.bands.features.forEach((feature, index, features) => {
       context.fillStyle = bandColor(index, features.length)
       for (const polygon of feature.geometry.coordinates) {
         context.beginPath()
-        for (const ring of polygon) trace(ring, true)
+        for (const ring of polygon) trace(context, ring, project, true)
         context.fill('evenodd')
       }
     })
@@ -248,18 +334,11 @@ function paintTravelLayers(
     context.lineWidth = 1.4
     for (const feature of result.contours.features) {
       context.beginPath()
-      for (const line of feature.geometry.coordinates) trace(line, false)
+      for (const line of feature.geometry.coordinates) trace(context, line, project, false)
       context.stroke()
     }
   }
-  if (visible.samples) for (const sample of liveSamples ?? result?.samples ?? []) {
-    if (sample.status === 'outside_scope') continue
-    const [x, y] = project(sample.coordinates)
-    context.beginPath()
-    context.arc(x, y, 2.2, 0, 2 * Math.PI)
-    context.fillStyle = sampleColor(sample.status)
-    context.fill()
-  }
+  if (visible.samples) paintSamples(context, project, liveSamples ?? result?.samples ?? [])
 }
 
 function zoomForRadius(radius: number) {
