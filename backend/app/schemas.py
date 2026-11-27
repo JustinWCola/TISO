@@ -1,6 +1,6 @@
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 
 class Destination(BaseModel):
@@ -15,6 +15,7 @@ class Parameters(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     destination: Destination
+    destination_name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=256)] | None = None
     mode: Literal["driving"] = "driving"
     traffic_mode: Literal["current"] = "current"
     provider: Literal["amap"] = "amap"

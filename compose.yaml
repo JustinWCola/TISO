@@ -5,6 +5,7 @@ services:
     environment:
       AMAP_WEB_SERVICE_KEY: ${AMAP_WEB_SERVICE_KEY:-}
       TISO_SETTINGS_FILE: /var/lib/tiso/amap.json
+      TISO_RESULTS_FILE: /var/lib/tiso/queries.sqlite3
     volumes:
       - settings:/var/lib/tiso
     healthcheck:

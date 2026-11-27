@@ -11,11 +11,15 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from .amap_settings import read_settings, router as amap_settings_router, routing_key
 from .core.mainland import inside_mainland
 from .providers.amap import AmapProvider
-from .schemas import Parameters
-from .tasks import TERMINAL, Jobs, estimate
+from .query_store import QueryStore, ScheduleInput, ScheduleState
+from .scheduler import run_scheduler
+from .schemas import Destination, Parameters
+from .tasks import TERMINAL, Jobs, estimate, now
 
 PREFIX = "/api/v1"
 JOBS = f"{PREFIX}/isochrones/jobs"
+HISTORY = f"{PREFIX}/isochrones/history"
+SCHEDULES = f"{PREFIX}/isochrones/schedules"
 
 
 @asynccontextmanager
@@ -24,17 +28,23 @@ async def lifespan(app: FastAPI):
         app.state.amap_client = client
         app.state.amap_settings = read_settings()
         key = routing_key(app.state.amap_settings)
-        manager = Jobs(AmapProvider(key, client) if key else None)
+        store = app.state.query_store = QueryStore()
+        manager = Jobs(AmapProvider(key, client) if key else None, store)
         app.state.jobs = manager
+        scheduler = asyncio.create_task(run_scheduler(store, manager))
         try:
             yield
         finally:
+            scheduler.cancel()
+            with suppress(asyncio.CancelledError):
+                await scheduler
             if manager.active and not manager.active.done():
                 for job in manager.items.values():
                     if job.task is manager.active:
                         job.cancel()
                 with suppress(asyncio.CancelledError):
                     await manager.active
+            store.close()
 
 
 app = FastAPI(title="TISO", lifespan=lifespan)
@@ -80,13 +90,67 @@ async def capabilities(request: Request):
 
 @app.post(f"{PREFIX}/isochrones/estimate")
 async def estimate_job(params: Parameters):
-    validate_destination(params)
+    validate_destination(params.destination)
     return estimate(params)
 
 
-def validate_destination(params: Parameters) -> None:
-    if not inside_mainland(params.destination.lng, params.destination.lat):
+def validate_destination(destination: Destination) -> None:
+    if not inside_mainland(destination.lng, destination.lat):
         fail(422, "destination_outside_scope", "目的地须位于中国大陆陆地区域")
+
+
+@app.get(HISTORY)
+async def history(request: Request, limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0)):
+    rows = request.app.state.query_store.history(limit + 1, offset)
+    return {"items": rows[:limit], "more": len(rows) > limit}
+
+
+@app.get(f"{HISTORY}/{{job_id}}")
+async def history_result(job_id: str, request: Request):
+    record = request.app.state.query_store.result(job_id)
+    if record is None:
+        fail(404, "history_not_found", "历史结果不存在")
+    return record
+
+
+@app.delete(f"{HISTORY}/{{job_id}}")
+async def delete_history(job_id: str, request: Request):
+    if not request.app.state.query_store.delete_result(job_id):
+        fail(404, "history_not_found", "历史结果不存在")
+    request.app.state.jobs.items.pop(job_id, None)
+    return {"deleted": True}
+
+
+@app.get(SCHEDULES)
+async def schedules(request: Request):
+    return request.app.state.query_store.schedules()
+
+
+@app.post(SCHEDULES, status_code=201)
+async def create_schedule(settings: ScheduleInput, request: Request):
+    if settings.params.mode != "driving":
+        fail(422, "schedule_driving_only", "定时查询仅支持驾车")
+    validate_destination(settings.params.destination)
+    if request.app.state.jobs.amap is None:
+        fail(422, "provider_unavailable", "请先配置高德 Web 服务 Key")
+    if not estimate(settings.params)["fits_budget"]:
+        fail(422, "budget_exceeded", "超出计算预算")
+    return request.app.state.query_store.create_schedule(settings, now())
+
+
+@app.patch(f"{SCHEDULES}/{{schedule_id}}")
+async def set_schedule(schedule_id: str, state: ScheduleState, request: Request):
+    record = request.app.state.query_store.set_schedule(schedule_id, state.enabled, now())
+    if record is None:
+        fail(404, "schedule_not_found", "定时查询不存在")
+    return record
+
+
+@app.delete(f"{SCHEDULES}/{{schedule_id}}")
+async def delete_schedule(schedule_id: str, request: Request):
+    if not request.app.state.query_store.delete_schedule(schedule_id):
+        fail(404, "schedule_not_found", "定时查询不存在")
+    return {"deleted": True}
 
 
 @app.post(JOBS, status_code=202)
@@ -95,7 +159,7 @@ async def create_job(params: Parameters, request: Request):
     manager.prune()
     if manager.amap is None:
         fail(422, "provider_unavailable", "请在高德设置中配置 Web 服务 Key")
-    validate_destination(params)
+    validate_destination(params.destination)
     budget = estimate(params)
     if not budget["fits_budget"]:
         fail(422, "budget_exceeded", "超出计算预算", **budget)

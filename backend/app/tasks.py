@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import math
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -15,6 +16,7 @@ from .core.mainland import inside_mainland, local_mainland
 from .providers.amap import AmapProvider
 from .providers.base import DRIVING_CAPABILITIES, Point, TravelResult
 from .schemas import Parameters
+from .query_store import QueryStore
 
 TERMINAL = {"completed", "partial", "failed", "cancelled"}
 LOG = logging.getLogger(__name__)
@@ -105,8 +107,9 @@ class Job:
 
 
 class Jobs:
-    def __init__(self, amap: AmapProvider | None) -> None:
+    def __init__(self, amap: AmapProvider | None, store: QueryStore | None = None) -> None:
         self.amap = amap
+        self.store = store
         self.items: dict[str, Job] = {}
         self.active: asyncio.Task | None = None
 
@@ -116,14 +119,33 @@ class Jobs:
             if job.finished_at and job.finished_at < cutoff and job.task and job.task.done():
                 del self.items[job_id]
 
-    def create(self, params: Parameters, points: int) -> Job:
+    def create(
+        self, params: Parameters, points: int,
+        *, schedule_id: str | None = None, schedule_name: str | None = None,
+    ) -> Job:
         if len(self.items) >= 8:
             oldest = next(iter(self.items))
             del self.items[oldest]
         job = Job(params, points)
         self.items[job.id] = job
-        job.task = self.active = asyncio.create_task(self.run(job))
+        job.task = self.active = asyncio.create_task(self.run_recorded(job, schedule_id, schedule_name))
         return job
+
+    async def run_recorded(
+        self, job: Job, schedule_id: str | None, schedule_name: str | None,
+    ) -> None:
+        try:
+            await self.run(job)
+        finally:
+            store = self.store
+            if store is not None:
+                try:
+                    if job.result is not None and job.status in {"completed", "partial"}:
+                        store.save_result(job.id, job.params, job.result, job.status, schedule_id, schedule_name)
+                    if schedule_id:
+                        store.finish_schedule(schedule_id, job.status, job.error["message"] if job.error else None)
+                except sqlite3.Error:
+                    LOG.error("Could not save TISO query history or schedule status")
 
     async def run(self, job: Job) -> None:
         started_at = now()
