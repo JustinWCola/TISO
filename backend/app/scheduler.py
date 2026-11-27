@@ -6,7 +6,7 @@ from datetime import datetime
 from .core.mainland import inside_mainland
 from .query_store import QueryStore
 from .schemas import Parameters
-from .tasks import Jobs, estimate, now
+from .tasks import Jobs, now
 
 LOG = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ def dispatch_due(store: QueryStore, jobs: Jobs, current: datetime) -> None:
     if not inside_mainland(params.destination.lng, params.destination.lat):
         store.finish_schedule(schedule["id"], "skipped", "目的地已不在算路范围内")
         return
-    budget = estimate(params)
+    budget = jobs.estimate(params)
     if not budget["fits_budget"]:
         store.finish_schedule(schedule["id"], "skipped", "超出计算预算")
         return

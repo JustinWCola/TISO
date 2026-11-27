@@ -5,7 +5,8 @@ from math import hypot
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.providers.base import DRIVING_CAPABILITIES, TravelResult
+from app.providers.amap_config import AmapRoutingConfig
+from app.providers.base import Capabilities, TravelResult
 from app.query_store import QueryStore, ScheduleInput
 from app.scheduler import dispatch_due
 from app.schemas import Parameters
@@ -20,7 +21,7 @@ class OfflineRoutes:
         self.calls = 0
 
     def capabilities(self):
-        return DRIVING_CAPABILITIES
+        return Capabilities(frozenset({"driving"}), True, False, False, AmapRoutingConfig().batch_size)
 
     async def travel_time_matrix(self, origins, destination, mode, *, before_request):
         assert mode == "driving"

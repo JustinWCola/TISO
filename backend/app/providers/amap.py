@@ -1,34 +1,42 @@
 import asyncio
 import logging
+import random
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time, timedelta
 from email.utils import parsedate_to_datetime
 
 import httpx
 
-from .amap_response import ENDPOINT, parse_results
-from .amap_metro import METRO_ENDPOINT, parse_metro, route_parameters
-from .base import DRIVING_CAPABILITIES, Capabilities, Point, TravelResult, validate_driving_request
+from .amap_config import AmapRoutingConfig
+from .amap_limiter import MAX_RETRY_WAIT_S, limiter_for
+from .amap_metro import BEIJING, METRO_ENDPOINT, parse_metro, route_parameters
+from .amap_response import ENDPOINT, check_success, parse_results
+from .base import Capabilities, Point, TravelResult, validate_driving_request
 
 # HTTPX logs request URLs at INFO, and the upstream requires the Key in the query.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+RATE_LIMIT_CODES = {"10004", "10014", "10015", "10019", "10020", "10021", "10029"}
+DAILY_LIMIT_CODES = {"10003", "10044", "10045"}
+RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
+MAX_ATTEMPTS = 3
+
 
 class AmapProvider:
-    def __init__(self, key: str, client: httpx.AsyncClient) -> None:
+    def __init__(self, key: str, client: httpx.AsyncClient, config: AmapRoutingConfig | None = None) -> None:
         self.key = key
         self.client = client
-        self.next_request_at = 0.0
+        self.config = config if config is not None else AmapRoutingConfig.from_env()
 
     def capabilities(self) -> Capabilities:
-        return DRIVING_CAPABILITIES
+        return Capabilities(frozenset({"driving"}), True, False, False, self.config.batch_size)
 
     async def travel_time_matrix(
         self, origins: list[Point], destination: Point, mode: str,
         departure_time: datetime | None = None, *,
         before_request: Callable[[], None] | None = None,
     ) -> list[TravelResult]:
-        validate_driving_request(origins, mode, departure_time)
+        validate_driving_request(origins, mode, departure_time, max_origins=self.capabilities().max_origins)
         params = {
             "key": self.key,
             "origins": "|".join(f"{p.lon:.6f},{p.lat:.6f}" for p in origins),
@@ -50,33 +58,55 @@ class AmapProvider:
         return parse_metro(await self._get(METRO_ENDPOINT, params, before_request), origin)
 
     async def _get(self, endpoint: str, params: dict, before_request: Callable[[], None] | None) -> object:
-        clock = asyncio.get_running_loop()
-        for attempt in range(3):
-            await asyncio.sleep(max(0, self.next_request_at - clock.time()))
-            if before_request:
-                before_request()
-            self.next_request_at = clock.time() + 1
-            try:
-                async with asyncio.timeout(15):
-                    response = await self.client.get(endpoint, params=params)
-            except (httpx.RequestError, TimeoutError):
-                if attempt == 2 or before_request is None:
-                    raise ValueError("高德请求超时或连接失败") from None
-            else:
-                if response.status_code == 200:
-                    break
-                retryable = response.status_code in {429, 500, 502, 503, 504}
-                if not retryable or attempt == 2 or before_request is None:
-                    raise ValueError(f"高德 HTTP 请求失败（{response.status_code}）")
-                delay = retry_delay(response.headers.get("Retry-After"))
-                if delay > 15:
-                    raise ValueError("高德要求等待后再试，请稍后重新生成")
-                self.next_request_at = max(self.next_request_at, clock.time() + delay)
-            await asyncio.sleep(1.0 * 2 ** attempt)
-        try:
-            return response.json()
-        except (ValueError, RecursionError):
-            raise ValueError("高德返回了无效 JSON") from None
+        limiter = limiter_for(self.key, self.config)
+        for attempt in range(MAX_ATTEMPTS):
+            backoff = 2.0 ** attempt + random.uniform(0, 0.25)
+            retry_after = 0.0
+            async with limiter.request(before_request):
+                try:
+                    async with asyncio.timeout(15):
+                        response = await self.client.get(endpoint, params=params)
+                except (httpx.RequestError, TimeoutError):
+                    error = "高德请求超时或连接失败"
+                else:
+                    retry_after = retry_delay(response.headers.get("Retry-After"))
+                    if response.status_code == 200:
+                        payload = response_json(response)
+                        code = str(payload.get("infocode", "")) if isinstance(payload, dict) else ""
+                        if not isinstance(payload, dict) or str(payload.get("status")) == "1":
+                            return payload
+                        if code not in RATE_LIMIT_CODES:
+                            if code in DAILY_LIMIT_CODES:
+                                limiter.block(until_next_amap_day(), f"Amap business error (infocode {code})")
+                            return check_success(payload)
+                        error = f"Amap business error (infocode {code})"
+                        if code == "10004":
+                            retry_after = max(60, retry_after)
+                        limiter.cool_down(max(backoff, retry_after))
+                    else:
+                        error = f"高德 HTTP 请求失败（{response.status_code}）"
+                        if response.status_code not in RETRYABLE_HTTP_STATUSES:
+                            raise ValueError(error)
+                        if response.status_code == 429 or retry_after:
+                            limiter.cool_down(max(backoff, retry_after))
+            if retry_after > MAX_RETRY_WAIT_S:
+                raise ValueError(f"{error}，高德要求等待后再试，请稍后重新生成")
+            if attempt == MAX_ATTEMPTS - 1 or before_request is None:
+                raise ValueError(error)
+            await asyncio.sleep(backoff)
+
+
+def response_json(response: httpx.Response) -> object:
+    try:
+        return response.json()
+    except (ValueError, RecursionError):
+        raise ValueError("高德返回了无效 JSON") from None
+
+
+def until_next_amap_day() -> float:
+    current = datetime.now(BEIJING)
+    midnight = datetime.combine(current.date() + timedelta(days=1), time(), BEIJING)
+    return (midnight - current).total_seconds()
 
 
 def retry_delay(header: str | None) -> float:

@@ -16,8 +16,9 @@ from .core.mainland import inside_mainland, local_mainland
 from .core.metro_network import MetroNetwork
 from .metro_job import run_metro
 from .providers.amap import AmapProvider
-from .providers.base import DRIVING_CAPABILITIES, Point, TravelResult
-from .schemas import Parameters
+from .providers.amap_config import AmapRoutingConfig
+from .providers.base import Point, TravelResult
+from .schemas import DrivingBudget, Parameters
 from .query_store import QueryStore
 
 TERMINAL = {"completed", "partial", "failed", "cancelled"}
@@ -38,13 +39,12 @@ def routing_grid(params: Parameters) -> Grid:
     }))
 
 
-def estimate(params: Parameters) -> dict:
+def estimate(params: Parameters, batch_size: int) -> dict:
     grid = routing_grid(params)
     nodes = ([(0, 0), *inner_nodes(grid)][:max(7, params.max_points)]
              if params.radius_m is None else list(seed_nodes(grid)))
     points = len(nodes)
     route_points = sum(node != (0, 0) and inside_mainland(*grid.coordinates(*meters(node))) for node in nodes)
-    batch_size = DRIVING_CAPABILITIES.max_origins
     batches = math.ceil(route_points / batch_size)
     possible_extra = max(0, params.max_requests - batches) * batch_size
     return {
@@ -71,6 +71,7 @@ class Job:
     completed_points: int = 0
     requests_sent: int = 0
     provider_batches: int = 0
+    routing_attempts: list[dict] = field(default_factory=list)
     observed_from: str | None = None
     observed_to: str | None = None
     error: dict | None = None
@@ -99,21 +100,37 @@ class Job:
 
     def cancel(self) -> None:
         if self.status not in TERMINAL:
+            was_queued = self.status == "queued"
             self.preview = None
             self.publish("cancelled", "cancelled")
-            # An in-progress geometry thread must finish before another job starts.
-            if self.task and not self.building_geometry:
+            # Let queued jobs enter their recording wrapper and geometry threads finish.
+            if self.task and not was_queued and not self.building_geometry:
                 self.task.cancel()
 
     building_geometry: bool = False
 
 
 class Jobs:
-    def __init__(self, amap: AmapProvider | None, store: QueryStore | None = None) -> None:
+    def __init__(
+        self, amap: AmapProvider | None, store: QueryStore | None = None,
+        *, routing_config: AmapRoutingConfig | None = None,
+    ) -> None:
         self.amap = amap
         self.store = store
+        self.routing_config = routing_config if routing_config is not None else AmapRoutingConfig.from_env()
+        self.driving_budget = DrivingBudget.from_env()
         self.items: dict[str, Job] = {}
         self.active: asyncio.Task | None = None
+
+    def with_driving_defaults(self, params: Parameters) -> Parameters:
+        if params.mode != "driving":
+            return params
+        defaults = self.driving_budget.model_dump(exclude=params.model_fields_set)
+        return params.model_copy(update=defaults)
+
+    def estimate(self, params: Parameters) -> dict:
+        batch_size = self.amap.capabilities().max_origins if self.amap else self.routing_config.batch_size
+        return estimate(params, batch_size)
 
     def prune(self) -> None:
         cutoff = now() - timedelta(minutes=30)
@@ -137,7 +154,8 @@ class Jobs:
         self, job: Job, network: MetroNetwork | None, schedule_id: str | None, schedule_name: str | None,
     ) -> None:
         try:
-            await self.run(job, network)
+            if job.status != "cancelled":
+                await self.run(job, network)
         finally:
             store = self.store
             if store is not None:
@@ -176,33 +194,51 @@ class Jobs:
             async def route(points: list[Point], stage: str) -> None:
                 job.publish("running", stage)
                 eligible = []
-                for point in points:
+                unique = {point.id: point for point in points if point.id not in results}
+                for point in unique.values():
                     if inside_mainland(point.lon, point.lat):
                         eligible.append(point)
                         continue
                     item = TravelResult(point.id, None, None, "outside_scope", "outside_mainland", now())
                     results[point.id] = item
                     job.samples.append(sample_record(point, item))
-                if len(eligible) != len(points):
+                if len(eligible) != len(unique):
                     job.completed_points = len(results)
                     job.publish("running", stage)
 
-                for offset in range(0, len(eligible), batch_size):
-                    if job.requests_sent >= job.params.max_requests:
-                        raise ValueError("已达外部请求预算，含重试")
-                    batch = eligible[offset:offset + batch_size]
+                offsets = iter(range(0, len(eligible), batch_size))
+                first_error: ValueError | None = None
 
+                async def route_batch(batch: list[Point]) -> None:
+                    batch_number = 0
+                    attempts = 0
+
+                    # The limiter invokes this synchronously immediately before every HTTP attempt.
                     def before_request() -> None:
+                        nonlocal batch_number, attempts
+                        if job.status == "cancelled":
+                            raise asyncio.CancelledError
+                        if first_error is not None:
+                            raise ValueError(str(first_error))
                         if job.requests_sent >= job.params.max_requests:
                             raise ValueError("已达外部请求预算，含重试")
-                        requested.update(point.id for point in batch)
+                        if not attempts:
+                            requested.update(point.id for point in batch)
+                            job.provider_batches += 1
+                            batch_number = job.provider_batches
+                        attempts += 1
                         job.requests_sent += 1
+                        job.routing_attempts.append({
+                            "batch": batch_number, "attempt": attempts,
+                            "point_count": len(batch), "sent_at": now().isoformat(),
+                        })
                         job.publish("running", stage)
 
-                    job.provider_batches += 1
                     batch_results = await provider.travel_time_matrix(
                         batch, destination, "driving", before_request=before_request,
                     )
+                    if job.status == "cancelled":
+                        return
                     batch_points = {point.id: point for point in batch}
                     for item in batch_results:
                         results[item.point_id] = item
@@ -212,6 +248,25 @@ class Jobs:
                         job.observed_to = max(job.observed_to or observed_at, observed_at)
                     job.completed_points = len(results)
                     job.publish("running", stage)
+
+                async def worker() -> None:
+                    nonlocal first_error
+                    for offset in offsets:
+                        if first_error is not None:
+                            return
+                        try:
+                            await route_batch(eligible[offset:offset + batch_size])
+                        except ValueError as error:
+                            if first_error is None:
+                                first_error = error
+                            return
+
+                workers = min(self.routing_config.max_concurrency, math.ceil(len(eligible) / batch_size))
+                async with asyncio.TaskGroup() as group:
+                    for _ in range(workers):
+                        group.create_task(worker())
+                if first_error is not None:
+                    raise first_error
 
             async def make_geometry() -> dict:
                 job.building_geometry = True
@@ -240,7 +295,8 @@ class Jobs:
                     "radius_m": radius, "spacing_m": grid.params.spacing_m,
                     "min_spacing_m": job.params.min_spacing_m,
                     "request_count": job.requests_sent, "route_points": len(requested),
-                    "provider_batches": job.provider_batches, "warnings": warnings,
+                    "provider_batches": job.provider_batches, "routing_attempts": job.routing_attempts.copy(),
+                    "warnings": warnings,
                     "started_at": started_at.isoformat(), "finished_at": now().isoformat(),
                     "observed_from": job.observed_from, "observed_to": job.observed_to,
                 }
@@ -322,6 +378,11 @@ class Jobs:
             status = ("partial" if expansion_error or refinement_error or result["error_count"] or result["unreachable_count"]
                       or (expanding and result["boundary_truncated"]) else "completed")
             job.publish(status, "completed")
+        except asyncio.CancelledError:
+            if job.status not in TERMINAL:
+                job.preview = None
+                job.publish("cancelled", "cancelled")
+            raise
         except ValueError as error:
             if job.status != "cancelled":
                 job.preview = None

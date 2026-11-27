@@ -64,6 +64,9 @@ def test_all_masked_geometry_is_empty():
 @pytest.fixture
 def amap_client(monkeypatch):
     monkeypatch.setenv("AMAP_WEB_SERVICE_KEY", "test-routing-key")
+    monkeypatch.setenv("AMAP_BATCH_SIZE", "20")
+    monkeypatch.setenv("AMAP_QPS", "10000")
+    monkeypatch.setenv("AMAP_MAX_CONCURRENCY", "1")
     monkeypatch.delenv("TISO_SETTINGS_FILE", raising=False)
 
     async def upstream(url, *, params):
@@ -383,7 +386,6 @@ def test_outer_routing_filters_coast_before_requests_and_clips_bands(amap_client
         origins = [tuple(map(float, point.split(","))) for point in params["origins"].split("|")]
         assert tuple(map(float, params["destination"].split(","))) == (lng, lat)
         batches.append(origins)
-        app.state.jobs.amap.next_request_at = 0.0
         assert all(x < coast for x, _ in origins)
         return httpx.Response(200, json={"status": "1", "results": [
             {"origin_id": i, "dest_id": 1, "duration": distance * 0.35, "distance": distance}
@@ -438,7 +440,6 @@ def test_shenzhen_coastal_job_uses_bundled_boundary(amap_client, monkeypatch):
         points = [tuple(map(float, origin.split(","))) for origin in params["origins"].split("|")]
         assert all(inside_mainland(x, y) for x, y in points)
         batches.append(points)
-        app.state.jobs.amap.next_request_at = 0.0
         return httpx.Response(200, json={"status": "1", "results": [
             {"origin_id": i, "dest_id": 1, "duration": distance * 0.4, "distance": distance}
             for i, (x, y) in enumerate(points, 1)

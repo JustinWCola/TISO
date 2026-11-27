@@ -5,12 +5,16 @@ from datetime import UTC, datetime
 import pytest
 
 from app.providers.base import Point, validate_driving_request
+from app.providers.amap_config import AmapRoutingConfig
 from scripts.verify_amap import ORIGINS, parse_results
 
 
 def test_driving_rejects_departure_time():
     with pytest.raises(ValueError, match="no departure time"):
-        validate_driving_request([Point("origin", 121.48, 31.23)], "driving", datetime.now(UTC))
+        validate_driving_request(
+            [Point("origin", 121.48, 31.23)], "driving", datetime.now(UTC),
+            max_origins=AmapRoutingConfig().batch_size,
+        )
 
 
 def test_amap_matches_out_of_order_results_and_reports_missing_or_invalid():

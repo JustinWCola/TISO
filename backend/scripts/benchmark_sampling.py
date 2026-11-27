@@ -13,10 +13,11 @@ from shapely.ops import unary_union
 from app.core.adaptive_geometry import build_adaptive_geometry, known_facets
 from app.core.field import Grid, build_geometry
 from app.core.hex_sampling import MAX_REFINEMENT_ROUNDS, HexSampler, meters
-from app.providers.base import DRIVING_CAPABILITIES, TravelResult
+from app.providers.amap_config import AmapRoutingConfig
+from app.providers.base import TravelResult
 from app.schemas import Parameters
 
-BATCH = DRIVING_CAPABILITIES.max_origins
+BATCH = AmapRoutingConfig.from_env().batch_size
 DESTINATION = {"lng": 121.4737, "lat": 31.2304}
 OBSERVED = datetime(2026, 11, 25, tzinfo=UTC)
 RADIUS = 8000

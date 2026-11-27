@@ -28,11 +28,12 @@ def parse_results(payload: object, origins: list[Point]) -> list[dict]:
     if not isinstance(payload.get("results"), list):
         raise ValueError("Amap response lacked a results array")
     by_index = {}
+    valid_origin_ids = {str(index) for index in range(1, len(origins) + 1)}
     for item in payload["results"]:
         if not isinstance(item, dict):
             raise ValueError("Malformed Amap result")
         origin_id = str(item.get("origin_id"))
-        if origin_id not in {str(index) for index in range(1, len(origins) + 1)}:
+        if origin_id not in valid_origin_ids:
             raise ValueError("Invalid origin_id in Amap result")
         index = int(origin_id)
         if index in by_index:

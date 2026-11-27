@@ -11,12 +11,13 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from .amap_settings import read_settings, router as amap_settings_router, routing_key
 from .core.mainland import inside_mainland
 from .providers.amap import AmapProvider
+from .providers.amap_config import AmapRoutingConfig
 from .metro_job import metro_estimate
 from .metro_store import MetroStore
 from .query_store import QueryStore, ScheduleInput, ScheduleState
 from .scheduler import run_scheduler
-from .schemas import Destination, Parameters
-from .tasks import TERMINAL, Jobs, estimate, now
+from .schemas import DRIVING_MAX_POINTS, DRIVING_MAX_REQUESTS, Destination, Parameters
+from .tasks import TERMINAL, Jobs, now
 
 PREFIX = "/api/v1"
 JOBS = f"{PREFIX}/isochrones/jobs"
@@ -30,8 +31,9 @@ async def lifespan(app: FastAPI):
         app.state.amap_client = client
         app.state.amap_settings = read_settings()
         key = routing_key(app.state.amap_settings)
+        routing_config = AmapRoutingConfig.from_env()
         store = app.state.query_store = QueryStore()
-        manager = Jobs(AmapProvider(key, client) if key else None, store)
+        manager = Jobs(AmapProvider(key, client, routing_config) if key else None, store, routing_config=routing_config)
         app.state.jobs = manager
         app.state.metro_store = metro_store = MetroStore(client)
         scheduler = asyncio.create_task(run_scheduler(store, manager))
@@ -89,7 +91,7 @@ async def capabilities(request: Request):
     providers = ["amap"] if request.app.state.jobs.amap else []
     return {
         "providers": providers, "modes": ["driving", "metro"], "traffic_modes": ["current", "static"],
-        "coordinate_system": "GCJ-02", "max_points": 2000, "max_requests": 150,
+        "coordinate_system": "GCJ-02", "max_points": DRIVING_MAX_POINTS, "max_requests": DRIVING_MAX_REQUESTS,
         "sampling": "adaptive", "grid": "hexagonal",
         "supports_departure_time": False, "supports_arrival_time": False,
         "mode_capabilities": {
@@ -105,7 +107,8 @@ async def estimate_job(params: Parameters, request: Request):
     validate_destination(params.destination)
     if params.mode == "metro":
         return metro_estimate(params, request.app.state.metro_store.status(params.destination))
-    return estimate(params)
+    jobs = request.app.state.jobs
+    return jobs.estimate(jobs.with_driving_defaults(params))
 
 
 def validate_destination(destination: Destination) -> None:
@@ -145,11 +148,13 @@ async def create_schedule(settings: ScheduleInput, request: Request):
     if settings.params.mode != "driving":
         fail(422, "schedule_driving_only", "定时查询仅支持驾车")
     validate_destination(settings.params.destination)
-    if request.app.state.jobs.amap is None:
+    jobs = request.app.state.jobs
+    if jobs.amap is None:
         fail(422, "provider_unavailable", "请先配置高德 Web 服务 Key")
-    if not estimate(settings.params)["fits_budget"]:
+    params = jobs.with_driving_defaults(settings.params)
+    if not jobs.estimate(params)["fits_budget"]:
         fail(422, "budget_exceeded", "超出计算预算")
-    return request.app.state.query_store.create_schedule(settings, now())
+    return request.app.state.query_store.create_schedule(settings.model_copy(update={"params": params}), now())
 
 
 @app.patch(f"{SCHEDULES}/{{schedule_id}}")
@@ -179,6 +184,7 @@ async def create_metro_network(destination: Destination, request: Request):
 @app.post(JOBS, status_code=202)
 async def create_job(params: Parameters, request: Request):
     manager: Jobs = request.app.state.jobs
+    params = manager.with_driving_defaults(params)
     manager.prune()
     validate_destination(params.destination)
     network = None
@@ -190,7 +196,7 @@ async def create_job(params: Parameters, request: Request):
     else:
         if manager.amap is None:
             fail(422, "provider_unavailable", "请在高德设置中配置 Web 服务 Key")
-        budget = estimate(params)
+        budget = manager.estimate(params)
     if not budget["fits_budget"]:
         fail(422, "budget_exceeded", "超出计算预算", **budget)
     if manager.active and not manager.active.done():

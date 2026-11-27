@@ -4,6 +4,11 @@ services:
     build: ./backend
     environment:
       AMAP_WEB_SERVICE_KEY: ${AMAP_WEB_SERVICE_KEY:-}
+      AMAP_BATCH_SIZE: ${AMAP_BATCH_SIZE:-20}
+      AMAP_QPS: ${AMAP_QPS:-1}
+      AMAP_MAX_CONCURRENCY: ${AMAP_MAX_CONCURRENCY:-1}
+      TISO_DRIVING_DEFAULT_MAX_POINTS: ${TISO_DRIVING_DEFAULT_MAX_POINTS:-2000}
+      TISO_DRIVING_DEFAULT_MAX_REQUESTS: ${TISO_DRIVING_DEFAULT_MAX_REQUESTS:-150}
       TISO_SETTINGS_FILE: /var/lib/tiso/amap.json
       TISO_RESULTS_FILE: /var/lib/tiso/queries.sqlite3
       TISO_METRO_DIR: /var/lib/tiso/metro

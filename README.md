@@ -82,6 +82,8 @@ npm run test:e2e
 <summary>环境变量与部署细节</summary>
 
 - [.env.example](./.env.example) 提供 Compose 可用的变量模板。后端可从 `AMAP_WEB_SERVICE_KEY` 读默认 Web 服务 Key，前端构建可用 `VITE_AMAP_JS_KEY` 和 `VITE_AMAP_SERVICE_HOST`。
+- 驾车批大小、发请求速率和在途上限分别由 `AMAP_BATCH_SIZE`、`AMAP_QPS`、`AMAP_MAX_CONCURRENCY` 配置，默认依次为 20、1、1。裸机运行时把这些变量导入后端进程环境。参数范围、账户核验情况和离线结果见 [高德距离测量性能报告](./backend/AMAP_PERFORMANCE.md)。
+- `TISO_DRIVING_DEFAULT_MAX_POINTS` 和 `TISO_DRIVING_DEFAULT_MAX_REQUESTS` 设置新建驾车任务的默认点数与 HTTP 请求预算。默认 2,000 点和 150 次，最高可设为 20,000 点和 300 次。客户端可指定预算，已保存的日程沿用保存时的值。
 - 裸机后端可设置 `TISO_SETTINGS_FILE` 和 `TISO_RESULTS_FILE` 持久化高德设置与历史结果。省略时，数据保留在当前后端进程中。Compose 使用 `/var/lib/tiso` 下的配置文件、SQLite 数据库和地铁路网目录。
 - Nginx 将 REST 和 SSE 同源代理到后端。对外部署时，由 HTTPS 反向代理接入回环端口，为站点和 API 配置认证及限速，并关闭 SSE 缓冲。高德设置面板和内置代理仍通过回环地址访问。
 - 在使用自有代理 CA 的环境中，可通过 BuildKit secret 提供可信 CA 文件。

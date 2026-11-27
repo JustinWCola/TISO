@@ -123,7 +123,7 @@ async def update_settings(settings: AmapSettings, request: Request, response: Re
         raise HTTPException(500, "无法保存高德设置") from None
     if routing_key(settings) != routing_key(previous):
         key = routing_key(settings)
-        state.jobs.amap = AmapProvider(key, state.amap_client) if key else None
+        state.jobs.amap = AmapProvider(key, state.amap_client, state.jobs.routing_config) if key else None
     state.amap_settings = settings
     response.headers["Cache-Control"] = "no-store"
     return settings.public(state.jobs.amap is not None)

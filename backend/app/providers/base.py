@@ -24,9 +24,6 @@ class Capabilities:
     coordinate_system: str = "GCJ-02"
 
 
-DRIVING_CAPABILITIES = Capabilities(frozenset({"driving"}), True, False, False, 20)
-
-
 @dataclass(frozen=True)
 class TravelResult:
     point_id: str
@@ -47,9 +44,9 @@ class RoutingProvider(Protocol):
 
 
 def validate_driving_request(
-    origins: list[Point], mode: str, departure_time: datetime | None,
+    origins: list[Point], mode: str, departure_time: datetime | None, *, max_origins: int,
 ) -> None:
     if mode != "driving" or departure_time is not None:
         raise ValueError("Only driving with no departure time is supported")
-    if not 1 <= len(origins) <= DRIVING_CAPABILITIES.max_origins:
-        raise ValueError("Expected 1 to 20 origins per request")
+    if not 1 <= len(origins) <= max_origins:
+        raise ValueError(f"Expected 1 to {max_origins} origins per request")

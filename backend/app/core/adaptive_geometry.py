@@ -84,6 +84,8 @@ def build_adaptive_geometry(
     domain = (union_all([Polygon([meters(node) for node in cell]) for cell in sampler.leaves], grid_size=PRECISION_M)
               if sampler.expanding
               else GeometryPoint(0, 0).buffer(grid.params.radius_m, quad_segs=64))
+    if domain.is_empty:
+        return feature_collection([]), feature_collection([]), 0.0, not sampler.frontier_closed, 0
     land = intersection(domain, mainland, grid_size=PRECISION_M) if mainland is not None else domain
     support = union_all([Polygon([point[:2] for point in facet]) for facet in facets], grid_size=PRECISION_M)
     coverage = min(1.0, support.intersection(land).area / land.area) if land.area else 0.0
