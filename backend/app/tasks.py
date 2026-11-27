@@ -13,6 +13,8 @@ from .core.hex_sampling import (
     HexSampler, Node, meters, ring_nodes, ring_radius, seed_nodes, survey_outer,
 )
 from .core.mainland import inside_mainland, local_mainland
+from .core.metro_network import MetroNetwork
+from .metro_job import run_metro
 from .providers.amap import AmapProvider
 from .providers.base import DRIVING_CAPABILITIES, Point, TravelResult
 from .schemas import Parameters
@@ -120,7 +122,7 @@ class Jobs:
                 del self.items[job_id]
 
     def create(
-        self, params: Parameters, points: int,
+        self, params: Parameters, points: int, network: MetroNetwork | None = None,
         *, schedule_id: str | None = None, schedule_name: str | None = None,
     ) -> Job:
         if len(self.items) >= 8:
@@ -128,14 +130,14 @@ class Jobs:
             del self.items[oldest]
         job = Job(params, points)
         self.items[job.id] = job
-        job.task = self.active = asyncio.create_task(self.run_recorded(job, schedule_id, schedule_name))
+        job.task = self.active = asyncio.create_task(self.run_recorded(job, network, schedule_id, schedule_name))
         return job
 
     async def run_recorded(
-        self, job: Job, schedule_id: str | None, schedule_name: str | None,
+        self, job: Job, network: MetroNetwork | None, schedule_id: str | None, schedule_name: str | None,
     ) -> None:
         try:
-            await self.run(job)
+            await self.run(job, network)
         finally:
             store = self.store
             if store is not None:
@@ -147,7 +149,7 @@ class Jobs:
                 except sqlite3.Error:
                     LOG.error("Could not save TISO query history or schedule status")
 
-    async def run(self, job: Job) -> None:
+    async def run(self, job: Job, network: MetroNetwork | None = None) -> None:
         started_at = now()
         grid = routing_grid(job.params)
         expanding = job.params.radius_m is None
@@ -156,6 +158,9 @@ class Jobs:
         results = {"0:0": TravelResult("0:0", 0, 0, "ok", None, started_at)}
 
         try:
+            if network is not None:
+                await run_metro(job, network, started_at)
+                return
             provider = self.amap
             if provider is None:
                 raise ValueError("高德 Web 服务未配置")

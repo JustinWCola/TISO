@@ -11,6 +11,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from .amap_settings import read_settings, router as amap_settings_router, routing_key
 from .core.mainland import inside_mainland
 from .providers.amap import AmapProvider
+from .metro_job import metro_estimate
+from .metro_store import MetroStore
 from .query_store import QueryStore, ScheduleInput, ScheduleState
 from .scheduler import run_scheduler
 from .schemas import Destination, Parameters
@@ -31,6 +33,7 @@ async def lifespan(app: FastAPI):
         store = app.state.query_store = QueryStore()
         manager = Jobs(AmapProvider(key, client) if key else None, store)
         app.state.jobs = manager
+        app.state.metro_store = metro_store = MetroStore(client)
         scheduler = asyncio.create_task(run_scheduler(store, manager))
         try:
             yield
@@ -38,6 +41,10 @@ async def lifespan(app: FastAPI):
             scheduler.cancel()
             with suppress(asyncio.CancelledError):
                 await scheduler
+            if metro_store.task and not metro_store.task.done():
+                metro_store.task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await metro_store.task
             if manager.active and not manager.active.done():
                 for job in manager.items.values():
                     if job.task is manager.active:
@@ -81,16 +88,23 @@ async def health():
 async def capabilities(request: Request):
     providers = ["amap"] if request.app.state.jobs.amap else []
     return {
-        "providers": providers, "modes": ["driving"], "traffic_modes": ["current"],
+        "providers": providers, "modes": ["driving", "metro"], "traffic_modes": ["current", "static"],
         "coordinate_system": "GCJ-02", "max_points": 2000, "max_requests": 150,
         "sampling": "adaptive", "grid": "hexagonal",
         "supports_departure_time": False, "supports_arrival_time": False,
+        "mode_capabilities": {
+            "driving": {"traffic_modes": ["current"], "supports_arrival_time": False},
+            "metro": {"traffic_modes": ["static"], "supports_arrival_time": False,
+                      "automatic_city": True, "local_networks": True, "max_requests": 0},
+        },
     }
 
 
 @app.post(f"{PREFIX}/isochrones/estimate")
-async def estimate_job(params: Parameters):
+async def estimate_job(params: Parameters, request: Request):
     validate_destination(params.destination)
+    if params.mode == "metro":
+        return metro_estimate(params, request.app.state.metro_store.status(params.destination))
     return estimate(params)
 
 
@@ -153,19 +167,35 @@ async def delete_schedule(schedule_id: str, request: Request):
     return {"deleted": True}
 
 
+@app.post(f"{PREFIX}/metro/networks", status_code=202)
+async def create_metro_network(destination: Destination, request: Request):
+    validate_destination(destination)
+    try:
+        return request.app.state.metro_store.start(destination)
+    except ValueError as error:
+        fail(409, "metro_build_busy", str(error))
+
+
 @app.post(JOBS, status_code=202)
 async def create_job(params: Parameters, request: Request):
     manager: Jobs = request.app.state.jobs
     manager.prune()
-    if manager.amap is None:
-        fail(422, "provider_unavailable", "请在高德设置中配置 Web 服务 Key")
     validate_destination(params.destination)
-    budget = estimate(params)
+    network = None
+    if params.mode == "metro":
+        network = request.app.state.metro_store.lookup(params.destination)
+        if network is None:
+            fail(409, "metro_network_missing", "请先生成目的地城市的地铁路网")
+        budget = metro_estimate(params, network.summary())
+    else:
+        if manager.amap is None:
+            fail(422, "provider_unavailable", "请在高德设置中配置 Web 服务 Key")
+        budget = estimate(params)
     if not budget["fits_budget"]:
         fail(422, "budget_exceeded", "超出计算预算", **budget)
     if manager.active and not manager.active.done():
         fail(409, "job_busy", "已有任务正在运行")
-    return manager.create(params, budget["total_points"]).snapshot()
+    return manager.create(params, budget["total_points"], network).snapshot()
 
 
 def get_job(request: Request, job_id: str):
