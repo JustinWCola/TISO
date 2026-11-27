@@ -138,22 +138,25 @@ function App() {
     const abort = new AbortController()
     let cursor = 0
     let timer = 0
-    let points: Sample[] = []
+    const points: Sample[] = []
     async function refresh() {
+      const previousLength = points.length
       try {
         while (!abort.signal.aborted && cursor < completedPoints.current) {
           const page = await request<{ samples: Sample[]; next: number }>(
             `${jobs}/${liveJobId}/samples?after=${cursor}`, undefined, abort.signal,
           )
           if (abort.signal.aborted || page.next <= cursor) break
-          points = [...points, ...page.samples]
+          points.push(...page.samples)
           cursor = page.next
-          setLiveSamples({ jobId: liveJobId!, points })
         }
       } catch {
         // Retry on the next refresh; routing progress is independent of the overlay.
       } finally {
-        if (!abort.signal.aborted) timer = window.setTimeout(() => void refresh(), 300)
+        if (!abort.signal.aborted) {
+          if (points.length !== previousLength) setLiveSamples({ jobId: liveJobId!, points: points.slice() })
+          timer = window.setTimeout(() => void refresh(), 300)
+        }
       }
     }
     void refresh()

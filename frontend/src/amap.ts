@@ -122,8 +122,8 @@ export async function createAmap(
   let result: Result | null = null
   let liveSamples: Sample[] | undefined
   let visible: TravelLayers = { bands: true, lines: true, samples: false }
-  let metro: ReturnType<typeof prepareMetroLayers> | null = null
-  let lastMetroFrame: number[] | null = null
+  let prepared: ReturnType<typeof prepareTravelLayers> | null = null
+  let lastFrame: number[] | null = null
 
   function project(point: Coordinates): Coordinates {
     const pixel = map.lngLatToContainer(point)
@@ -138,13 +138,13 @@ export async function createAmap(
     const ratio = window.devicePixelRatio || 1
     const pixelWidth = Math.round(width * ratio)
     const pixelHeight = Math.round(height * ratio)
-    const transform = metro?.transform(project)
+    const transform = prepared?.transform(project)
     if (transform) {
       const currentFrame = [width, height, ratio, ...transform]
-      if (currentFrame.every((value, index) => value === lastMetroFrame?.[index])) return
-      lastMetroFrame = currentFrame
+      if (currentFrame.every((value, index) => value === lastFrame?.[index])) return
+      lastFrame = currentFrame
     } else {
-      lastMetroFrame = null
+      lastFrame = null
     }
     if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
       canvas.width = pixelWidth
@@ -154,9 +154,12 @@ export async function createAmap(
     }
     context.setTransform(ratio, 0, 0, ratio, 0, 0)
     context.clearRect(0, 0, width, height)
-    if (metro && transform) {
-      metro.paint(context, visible, transform)
-      if (visible.samples) paintSamples(context, project, liveSamples ?? result?.samples ?? [])
+    if (prepared && transform) {
+      prepared.paint(context, visible, transform)
+      if (visible.samples) {
+        const projectSample = prepared.sampleProjector(transform)
+        paintSamples(context, projectSample, liveSamples ?? result?.samples ?? [], width, height)
+      }
     } else {
       paintTravelLayers(context, project, result, visible, liveSamples)
     }
@@ -212,14 +215,16 @@ export async function createAmap(
       paint()
     },
     setResult(next: Result | null, layers: TravelLayers, points?: Sample[]) {
+      if (next === result && layers.bands === visible.bands && layers.lines === visible.lines
+          && layers.samples === visible.samples && (!layers.samples || points === liveSamples)) return
       if (next !== result) {
-        metro = next?.mode === 'metro' && typeof Path2D !== 'undefined' ? prepareMetroLayers(next) : null
+        prepared = next && typeof Path2D !== 'undefined' ? prepareTravelLayers(next) : null
       }
       result = next
       visible = layers
       liveSamples = points
-      lastMetroFrame = null
-      paint()
+      lastFrame = null
+      schedulePaint()
     },
     destroy() {
       window.clearTimeout(layerTimeout)
@@ -253,7 +258,7 @@ function mercatorY(latitude: number) {
   return -Math.asinh(Math.tan(latitude * Math.PI / 180)) * 180 / Math.PI
 }
 
-function prepareMetroLayers(result: Result) {
+function prepareTravelLayers(result: Result) {
   const { lng, lat } = result.destination
   const originY = mercatorY(lat)
   const northDelta = mercatorY(lat + 1) - originY
@@ -281,6 +286,12 @@ function prepareMetroLayers(result: Result) {
       const matrix: MapTransform = [a, b, c, d, x, y]
       if (matrix.every(Number.isFinite) && Math.abs(a * d - b * c) > 1e-8) return matrix
     },
+    sampleProjector([a, b, c, d, x, y]: MapTransform): Project {
+      return point => {
+        const [w, h] = world(point)
+        return [a * w + c * h + x, b * w + d * h + y]
+      }
+    },
     paint(context: CanvasRenderingContext2D, visible: TravelLayers, matrix: MapTransform) {
       context.save()
       context.transform(...matrix)
@@ -302,15 +313,25 @@ function prepareMetroLayers(result: Result) {
   }
 }
 
-function paintSamples(context: CanvasRenderingContext2D, project: Project, samples: Sample[]) {
+function paintSamples(context: CanvasRenderingContext2D, project: Project, samples: Sample[],
+  width = Infinity, height = Infinity) {
+  const radius = 2.2
+  let color: string | undefined
   for (const sample of samples) {
     if (sample.status === 'outside_scope') continue
     const [x, y] = project(sample.coordinates)
-    context.beginPath()
-    context.arc(x, y, 2.2, 0, 2 * Math.PI)
-    context.fillStyle = sampleColor(sample.status)
-    context.fill()
+    if (x < -radius || x > width + radius || y < -radius || y > height + radius) continue
+    const nextColor = sampleColor(sample.status)
+    if (nextColor !== color) {
+      if (color !== undefined) context.fill()
+      color = nextColor
+      context.fillStyle = color
+      context.beginPath()
+    }
+    context.moveTo(x + radius, y)
+    context.arc(x, y, radius, 0, 2 * Math.PI)
   }
+  if (color !== undefined) context.fill()
 }
 
 export function paintTravelLayers(
